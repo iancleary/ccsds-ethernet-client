@@ -5,7 +5,6 @@
 # ///
 
 import contextlib
-import datetime as dt
 import io
 import subprocess
 import sys
@@ -18,8 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cut_release  # noqa: E402
 
-VERSION = "v2026.08.18.00"
-TODAY = dt.date(2026, 8, 18)
+VERSION = "v0.1.0"
 SHA = "a" * 40
 CANONICAL_ORIGIN = "git@github.com:iancleary/ccsds-ethernet-client.git"
 
@@ -86,31 +84,30 @@ class FakeRun:
 
 
 class VersionTests(unittest.TestCase):
-    def test_parse_version_is_ascii_fixed_width_and_calendar_valid(self) -> None:
-        self.assertEqual(cut_release.parse_version(VERSION), (TODAY, 0))
+    def test_package_version_comes_from_cargo_manifest(self) -> None:
+        self.assertEqual(cut_release.package_version(), VERSION)
+
+    def test_parse_version_is_ascii_semver(self) -> None:
+        self.assertEqual(cut_release.parse_version(VERSION), (0, 1, 0))
         invalid = (
-            "2026.08.18.00",
-            "v2026.8.18.00",
-            "v2026.08.18.0",
-            "v2026.08.18.000",
-            "v2026.02.30.00",
-            "v٢٠٢٦.٠٨.١٨.٠٠",
-            "v２０２６.０８.１８.００",
+            "0.1.0",
+            "v0.1",
+            "v0.1.0.0",
+            "v00.1.0",
+            "v0.01.0",
+            "v0.1.00",
+            "v٠.١.٠",
+            "v０.１.０",
         )
         for version in invalid:
             with self.subTest(version=version), self.assertRaises(ValueError):
                 cut_release.parse_version(version)
 
-    def test_next_version_uses_daily_sequence_and_rejects_exhaustion(self) -> None:
-        self.assertEqual(cut_release.next_version([], TODAY), VERSION)
-        self.assertEqual(
-            cut_release.next_version(
-                ["v2026.08.17.09", "v2026.08.18.00", "v2026.08.18.02"], TODAY
-            ),
-            "v2026.08.18.03",
-        )
-        with self.assertRaisesRegex(ValueError, "no release sequence remains"):
-            cut_release.next_version(["v2026.08.18.99"], TODAY)
+    def test_next_version_uses_manifest_and_rejects_released_version(self) -> None:
+        with mock.patch.object(cut_release, "package_version", return_value=VERSION):
+            self.assertEqual(cut_release.next_version([]), VERSION)
+            with self.assertRaisesRegex(ValueError, "package version already released"):
+                cut_release.next_version([VERSION])
 
     def test_version_queries_only_cross_documented_read_only_boundaries(self) -> None:
         expected_calls = [
@@ -122,7 +119,6 @@ class VersionTests(unittest.TestCase):
         for flag in ("--print-current-version", "--print-next-version"):
             with self.subTest(flag=flag):
                 fake = FakeRun()
-                fake.remote_tags[VERSION] = SHA
                 with mock.patch.object(cut_release, "run", side_effect=fake), contextlib.redirect_stdout(
                     io.StringIO()
                 ):
@@ -138,7 +134,6 @@ class ReleaseTests(unittest.TestCase):
         dry_run: bool = False,
         notes_text: str = "Reviewed release notes\n",
         version: str = VERSION,
-        today: dt.date = TODAY,
     ) -> tuple[list[tuple[str, ...]], list[str | None], str]:
         with tempfile.TemporaryDirectory() as directory:
             notes = Path(directory, "notes.md")
@@ -147,7 +142,7 @@ class ReleaseTests(unittest.TestCase):
             with mock.patch.object(cut_release, "run", side_effect=fake), mock.patch(
                 "cut_release.shutil.which", return_value="/bin/tool"
             ), contextlib.redirect_stdout(output):
-                cut_release.release(version, notes, dry_run, today)
+                cut_release.release(version, notes, dry_run)
             return fake.calls, fake.inputs, output.getvalue()
 
     def test_just_boundary_passes_metacharacter_notes_path_as_one_argument(self) -> None:
@@ -156,14 +151,12 @@ class ReleaseTests(unittest.TestCase):
             notes = Path(f"{directory}/notes||touch {marker}")
             notes.parent.mkdir(parents=True)
             notes.write_text("", encoding="utf-8")
-            today = dt.datetime.now(dt.timezone.utc).date()
-
             result = subprocess.run(
                 (
                     "just",
                     "cut-release",
                     "--version",
-                    f"v{today:%Y.%m.%d}.00",
+                    VERSION,
                     "--notes-file",
                     str(notes),
                 ),
@@ -176,20 +169,20 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("notes file must exist and be non-empty", result.stderr)
             self.assertFalse(marker.exists())
 
-    def test_release_rejects_wrong_date_absent_and_blank_notes(self) -> None:
+    def test_release_rejects_invalid_version_absent_and_blank_notes(self) -> None:
         fake = FakeRun()
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cut_release, "run", side_effect=fake
         ):
             directory_path = Path(directory)
-            with self.assertRaisesRegex(ValueError, "today's UTC date"):
-                cut_release.release(VERSION, directory_path / "missing", False, dt.date(2026, 8, 19))
+            with self.assertRaisesRegex(ValueError, "vMAJOR.MINOR.PATCH"):
+                cut_release.release("0.1.0", directory_path / "missing", False)
             with self.assertRaisesRegex(ValueError, "notes file"):
-                cut_release.release(VERSION, directory_path / "missing", False, TODAY)
+                cut_release.release(VERSION, directory_path / "missing", False)
             blank = directory_path / "blank.md"
             blank.write_text(" \n\t", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "notes file"):
-                cut_release.release(VERSION, blank, False, TODAY)
+                cut_release.release(VERSION, blank, False)
         self.assertEqual(fake.calls, [])
 
     def test_release_rejects_dirty_wrong_or_diverged_main(self) -> None:
@@ -206,6 +199,12 @@ class ReleaseTests(unittest.TestCase):
                     self.run_release(fake)
                 self.assertFalse(any(call[:2] == ("git", "push") for call in fake.calls))
                 self.assertFalse(any(call[:3] == ("gh", "release", "create") for call in fake.calls))
+
+    def test_release_version_must_match_cargo_manifest(self) -> None:
+        fake = FakeRun()
+        with self.assertRaisesRegex(ValueError, "version must match Cargo.toml"):
+            self.run_release(fake, version="v0.2.0")
+        self.assertFalse(any(call[:2] == ("git", "push") for call in fake.calls))
 
     def test_release_accepts_only_canonical_github_origin(self) -> None:
         accepted = (
@@ -283,9 +282,9 @@ class ReleaseTests(unittest.TestCase):
                 2,
             ),
             (
-                "new tag changed the next version",
-                lambda fake: fake.remote_tags.__setitem__("v2026.08.18.01", moved_sha),
-                "version must be the next release",
+                "new tag conflicts with the validated SHA",
+                lambda fake: fake.remote_tags.__setitem__(VERSION, moved_sha),
+                "remote tag .* expected",
                 2,
             ),
         )
@@ -346,7 +345,7 @@ class ReleaseTests(unittest.TestCase):
             with mock.patch.object(cut_release, "run", side_effect=fake), mock.patch(
                 "cut_release.shutil.which", return_value="/bin/tool"
             ):
-                cut_release.release(VERSION, notes, False, TODAY)
+                cut_release.release(VERSION, notes, False)
         create_index = next(i for i, call in enumerate(fake.calls) if call[:3] == ("gh", "release", "create"))
         self.assertEqual(fake.inputs[create_index], "reviewed snapshot\n")
         self.assertEqual(fake.calls[create_index][-2:], ("-", "--verify-tag"))

@@ -16,7 +16,7 @@ check:
     uv run scripts/test_cut_release.py
     git diff --check -- .
 
-# Validate and create a CalVer GitHub release.
+# Validate and create a SemVer GitHub release.
 [positional-arguments]
 cut-release *args:
     uv run scripts/cut_release.py "$@"
