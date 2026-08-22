@@ -1,0 +1,331 @@
+use std::net::Ipv4Addr;
+use std::str::FromStr;
+
+use ccsds_ethernet_client::{
+    BoundedPacketRing, Endpoint, EthernetError, FrameDisposition, MacAddress,
+    RAW_ETHERNET_CONFIG_SCHEMA_VERSION, RawEthernetConfig, RawEthernetEndpoint,
+    STANDARD_MTU_UDP_PAYLOAD_BYTES, build_udp_frame, parse_udp_frame,
+};
+
+const BOARD_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 209, 0);
+const HOST_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 209, 1);
+const BOARD_PORT: u16 = 24_576;
+const HOST_PORT: u16 = 49_152;
+
+fn raw_endpoint(mac: &str, ipv4: Ipv4Addr, port: u16) -> RawEthernetEndpoint {
+    RawEthernetEndpoint::new(
+        MacAddress::from_str(mac).expect("MAC"),
+        Endpoint::new(ipv4, port).expect("endpoint"),
+    )
+    .expect("raw endpoint")
+}
+
+fn config() -> RawEthernetConfig {
+    RawEthernetConfig::new(
+        RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+        "eth0",
+        raw_endpoint("02:00:00:00:00:01", HOST_IP, HOST_PORT),
+        raw_endpoint("02:00:00:00:00:7a", BOARD_IP, BOARD_PORT),
+        8,
+    )
+    .expect("config")
+}
+
+fn inbound_frame_from(
+    sender: RawEthernetEndpoint,
+    recipient: RawEthernetEndpoint,
+    payload: &[u8],
+) -> Vec<u8> {
+    let reverse = RawEthernetConfig::new(
+        RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+        "eth0",
+        sender,
+        recipient,
+        8,
+    )
+    .expect("reverse config");
+    build_udp_frame(&reverse, payload, 17).expect("build inbound frame")
+}
+
+fn inbound_frame(payload: &[u8]) -> Vec<u8> {
+    let expected = config();
+    inbound_frame_from(expected.board(), expected.host(), payload)
+}
+
+fn checksum(bytes: &[u8]) -> u16 {
+    let mut sum = bytes.chunks(2).fold(0_u32, |sum, chunk| {
+        sum + u32::from(if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from(chunk[0]) << 8
+        })
+    });
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn set_ipv4_checksum(frame: &mut [u8]) {
+    frame[24..26].fill(0);
+    let value = checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&value.to_be_bytes());
+}
+
+fn set_udp_checksum(frame: &mut [u8]) {
+    let udp_length = usize::from(u16::from_be_bytes([frame[38], frame[39]]));
+    frame[40..42].fill(0);
+    let mut pseudo_header = Vec::with_capacity(12 + udp_length);
+    pseudo_header.extend_from_slice(&frame[26..34]);
+    pseudo_header.extend_from_slice(&[0, 17]);
+    pseudo_header.extend_from_slice(&(udp_length as u16).to_be_bytes());
+    pseudo_header.extend_from_slice(&frame[34..34 + udp_length]);
+    let value = checksum(&pseudo_header);
+    frame[40..42].copy_from_slice(&if value == 0 { 0xffff } else { value }.to_be_bytes());
+}
+
+#[test]
+fn config_rejects_ambiguous_or_unsupported_identity() {
+    assert!(MacAddress::from_str("02:00:00:00:00:7a").is_ok());
+    assert!(MacAddress::from_str("ff:ff:ff:ff:ff:ff").is_err());
+    assert!(MacAddress::from_str("00:00:00:00:00:00").is_err());
+    assert!(Endpoint::new(Ipv4Addr::UNSPECIFIED, BOARD_PORT).is_err());
+    assert!(Endpoint::new(BOARD_IP, 0).is_err());
+
+    let host = raw_endpoint("02:00:00:00:00:01", HOST_IP, HOST_PORT);
+    let board = raw_endpoint("02:00:00:00:00:7a", BOARD_IP, BOARD_PORT);
+    assert!(matches!(
+        RawEthernetConfig::new(2, "eth0", host, board, 8),
+        Err(EthernetError::UnsupportedSchemaVersion(2))
+    ));
+    assert!(RawEthernetConfig::new(1, "../eth0", host, board, 8).is_err());
+    assert!(RawEthernetConfig::new(1, "eth0", host, host, 8).is_err());
+    assert!(RawEthernetConfig::new(1, "eth0", host, board, 0).is_err());
+}
+
+#[test]
+fn exact_udp_frame_round_trip_is_strict() {
+    let payload = (0_u8..54).collect::<Vec<_>>();
+    let frame = inbound_frame(&payload);
+    assert_eq!(frame.len(), 96);
+    assert_eq!(
+        parse_udp_frame(&frame, &config()),
+        FrameDisposition::Matched {
+            payload: payload.clone(),
+            sender: Endpoint::new(BOARD_IP, BOARD_PORT).expect("board endpoint"),
+        }
+    );
+
+    let mut foreign_destination_mac = frame.clone();
+    foreign_destination_mac[0] ^= 0x10;
+    assert_eq!(
+        parse_udp_frame(&foreign_destination_mac, &config()),
+        FrameDisposition::Foreign
+    );
+    let mut foreign_source_mac = frame.clone();
+    foreign_source_mac[6] ^= 0x10;
+    assert_eq!(
+        parse_udp_frame(&foreign_source_mac, &config()),
+        FrameDisposition::Foreign
+    );
+
+    let selected = config();
+    let foreign_source_ip = inbound_frame_from(
+        RawEthernetEndpoint::new(
+            selected.board().mac(),
+            Endpoint::new(Ipv4Addr::new(169, 254, 209, 2), BOARD_PORT).expect("endpoint"),
+        )
+        .expect("raw endpoint"),
+        selected.host(),
+        &payload,
+    );
+    assert_eq!(
+        parse_udp_frame(&foreign_source_ip, &selected),
+        FrameDisposition::Foreign
+    );
+    let foreign_destination_ip = inbound_frame_from(
+        selected.board(),
+        RawEthernetEndpoint::new(
+            selected.host().mac(),
+            Endpoint::new(Ipv4Addr::new(169, 254, 209, 3), HOST_PORT).expect("endpoint"),
+        )
+        .expect("raw endpoint"),
+        &payload,
+    );
+    assert_eq!(
+        parse_udp_frame(&foreign_destination_ip, &selected),
+        FrameDisposition::Foreign
+    );
+    let foreign_source_port = inbound_frame_from(
+        RawEthernetEndpoint::new(
+            selected.board().mac(),
+            Endpoint::new(BOARD_IP, BOARD_PORT + 1).expect("endpoint"),
+        )
+        .expect("raw endpoint"),
+        selected.host(),
+        &payload,
+    );
+    assert_eq!(
+        parse_udp_frame(&foreign_source_port, &selected),
+        FrameDisposition::Foreign
+    );
+    let foreign_destination_port = inbound_frame_from(
+        selected.board(),
+        RawEthernetEndpoint::new(
+            selected.host().mac(),
+            Endpoint::new(HOST_IP, HOST_PORT + 1).expect("endpoint"),
+        )
+        .expect("raw endpoint"),
+        &payload,
+    );
+    assert_eq!(
+        parse_udp_frame(&foreign_destination_port, &selected),
+        FrameDisposition::Foreign
+    );
+
+    let mut bad_ip_checksum = frame.clone();
+    bad_ip_checksum[24] ^= 1;
+    assert_eq!(
+        parse_udp_frame(&bad_ip_checksum, &config()),
+        FrameDisposition::Invalid(EthernetError::InvalidIpv4Checksum)
+    );
+
+    let mut bad_udp_checksum = frame;
+    bad_udp_checksum[40..42].copy_from_slice(&1_u16.to_be_bytes());
+    assert_eq!(
+        parse_udp_frame(&bad_udp_checksum, &config()),
+        FrameDisposition::Invalid(EthernetError::InvalidUdpChecksum)
+    );
+}
+
+#[test]
+fn short_frames_are_padded_without_changing_protocol_lengths() {
+    let frame = build_udp_frame(&config(), &[1, 2, 3], 0x1234).expect("build frame");
+    assert_eq!(frame.len(), 60);
+    assert_eq!(u16::from_be_bytes([frame[16], frame[17]]), 31);
+    assert_eq!(u16::from_be_bytes([frame[38], frame[39]]), 11);
+    assert_eq!(&frame[42..45], &[1, 2, 3]);
+    assert!(frame[45..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn standard_mtu_payload_ceiling_is_enforced() {
+    let payload = vec![0x5a; STANDARD_MTU_UDP_PAYLOAD_BYTES];
+    let frame = build_udp_frame(&config(), &payload, 1).expect("maximum payload");
+    assert_eq!(frame.len(), 1514);
+    assert_eq!(&frame[40..42], &[0, 0]);
+    assert!(matches!(
+        build_udp_frame(&config(), &[0; STANDARD_MTU_UDP_PAYLOAD_BYTES + 1], 1),
+        Err(EthernetError::PayloadTooLarge(size))
+            if size == STANDARD_MTU_UDP_PAYLOAD_BYTES + 1
+    ));
+
+    let mut oversized = inbound_frame(&payload);
+    oversized.push(0);
+    oversized[16..18].copy_from_slice(&1501_u16.to_be_bytes());
+    oversized[38..40].copy_from_slice(&1481_u16.to_be_bytes());
+    set_ipv4_checksum(&mut oversized);
+    assert_eq!(
+        parse_udp_frame(&oversized, &config()),
+        FrameDisposition::Invalid(EthernetError::PayloadTooLarge(
+            STANDARD_MTU_UDP_PAYLOAD_BYTES + 1
+        ))
+    );
+}
+
+#[test]
+fn ipv4_and_udp_lengths_must_agree() {
+    let frame = inbound_frame(&[1, 2, 3]);
+
+    let mut short_ip = frame.clone();
+    short_ip[16..18].copy_from_slice(&27_u16.to_be_bytes());
+    assert_eq!(
+        parse_udp_frame(&short_ip, &config()),
+        FrameDisposition::Invalid(EthernetError::InvalidIpv4Header)
+    );
+
+    let mut mismatched_ip = frame.clone();
+    mismatched_ip[16..18].copy_from_slice(&30_u16.to_be_bytes());
+    set_ipv4_checksum(&mut mismatched_ip);
+    assert_eq!(
+        parse_udp_frame(&mismatched_ip, &config()),
+        FrameDisposition::Invalid(EthernetError::InvalidUdpLength)
+    );
+
+    let mut mismatched_udp = frame;
+    mismatched_udp[38..40].copy_from_slice(&10_u16.to_be_bytes());
+    assert_eq!(
+        parse_udp_frame(&mismatched_udp, &config()),
+        FrameDisposition::Invalid(EthernetError::InvalidUdpLength)
+    );
+}
+
+#[test]
+fn ipv4_fragment_bits_are_rejected_except_dont_fragment() {
+    let valid_df = inbound_frame(&[1, 2, 3]);
+    assert!(matches!(
+        parse_udp_frame(&valid_df, &config()),
+        FrameDisposition::Matched { .. }
+    ));
+
+    for flags_and_offset in [0x8000_u16, 0x2000, 0x0001] {
+        let mut fragmented = valid_df.clone();
+        fragmented[20..22].copy_from_slice(&flags_and_offset.to_be_bytes());
+        set_ipv4_checksum(&mut fragmented);
+        assert_eq!(
+            parse_udp_frame(&fragmented, &config()),
+            FrameDisposition::Invalid(EthernetError::FragmentedIpv4)
+        );
+    }
+}
+
+#[test]
+fn valid_nonzero_udp_checksum_is_accepted() {
+    let payload = [1, 2, 3, 4, 5];
+    let mut frame = inbound_frame(&payload);
+    set_udp_checksum(&mut frame);
+    assert_ne!(&frame[40..42], &[0, 0]);
+    assert_eq!(
+        parse_udp_frame(&frame, &config()),
+        FrameDisposition::Matched {
+            payload: payload.to_vec(),
+            sender: Endpoint::new(BOARD_IP, BOARD_PORT).expect("board endpoint"),
+        }
+    );
+}
+
+#[test]
+fn bounded_packet_ring_reports_overflow_and_maximum_depth() {
+    let mut ring = BoundedPacketRing::new(2).expect("ring");
+    assert!(ring.push(10));
+    assert!(ring.push(20));
+    assert!(!ring.push(30));
+    assert_eq!(ring.len(), 2);
+    assert_eq!(ring.maximum_depth(), 2);
+    assert_eq!(ring.dropped(), 1);
+    assert_eq!(ring.pop(), Some(10));
+    assert_eq!(ring.pop(), Some(20));
+    assert!(ring.is_empty());
+    assert!(BoundedPacketRing::<u8>::new(0).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interface_snapshot_validation_is_hardware_free() {
+    use ccsds_ethernet_client::InterfaceSnapshot;
+
+    let selected = config();
+    let valid = InterfaceSnapshot {
+        name: "eth0".to_owned(),
+        index: 2,
+        mac: selected.host().mac(),
+        up: true,
+        running: true,
+        loopback: false,
+    };
+    assert!(valid.validate_for(&selected).is_ok());
+
+    let mut wrong = valid;
+    wrong.loopback = true;
+    assert!(wrong.validate_for(&selected).is_err());
+}

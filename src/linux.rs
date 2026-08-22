@@ -1,0 +1,850 @@
+//! Linux `AF_PACKET` transport.
+//!
+//! The unsafe surface is intentionally limited to libc calls and pointer
+//! conversions in this module. Packet construction, parsing, correlation,
+//! and buffering remain safe Rust.
+
+use std::ffi::CStr;
+use std::io;
+use std::mem;
+use std::os::fd::RawFd;
+use std::ptr;
+use std::time::Instant;
+
+use crate::ethernet::{
+    FrameDisposition, MacAddress, RawEthernetConfig, build_udp_frame, parse_udp_frame,
+};
+use crate::transport::{
+    BoundedPacketRing, ReceivedFrame, Transport, TransportError, TransportStatistics,
+};
+
+const PACKET_STATISTICS: libc::c_int = 6;
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const MINIMUM_IPV4_UDP_FRAME_BYTES: usize = 42;
+const MAXIMUM_FRAME_BYTES: usize = 2048;
+const RECEIVE_DRAIN_PACKET_BUDGET: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceSnapshot {
+    pub name: String,
+    pub index: i32,
+    pub mac: MacAddress,
+    pub up: bool,
+    pub running: bool,
+    pub loopback: bool,
+}
+
+impl InterfaceSnapshot {
+    pub fn validate_for(&self, config: &RawEthernetConfig) -> Result<(), TransportError> {
+        if self.name != config.interface_name() {
+            return Err(other(format!(
+                "interface name changed: expected {:?}, got {:?}",
+                config.interface_name(),
+                self.name
+            )));
+        }
+        if self.mac != config.host().mac() {
+            return Err(other(format!(
+                "interface MAC mismatch on {}: expected {}, got {}",
+                self.name,
+                config.host().mac(),
+                self.mac
+            )));
+        }
+        if self.loopback {
+            return Err(other(format!(
+                "interface {} is loopback, not a dedicated Ethernet link",
+                self.name
+            )));
+        }
+        if !self.up || !self.running {
+            return Err(other(format!(
+                "interface {} is not both UP and RUNNING",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn inspect_interface(name: &str) -> Result<InterfaceSnapshot, TransportError> {
+    crate::ethernet::validate_interface_name(name).map_err(|error| other(error.to_string()))?;
+    let mut addresses: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: `addresses` is a valid out-pointer. A successful call returns a
+    // linked list owned by libc and released exactly once by `IfAddrsGuard`.
+    if unsafe { libc::getifaddrs(&mut addresses) } != 0 {
+        return Err(last_os_error("getifaddrs"));
+    }
+    let guard = IfAddrsGuard(addresses);
+    let mut current = guard.0;
+    while !current.is_null() {
+        // SAFETY: every node is part of the live getifaddrs list guarded above.
+        let entry = unsafe { &*current };
+        if !entry.ifa_name.is_null() && !entry.ifa_addr.is_null() {
+            // SAFETY: libc guarantees `ifa_name` is a NUL-terminated string.
+            let entry_name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+            // SAFETY: `ifa_addr` is non-null and its family identifies the
+            // concrete sockaddr layout before the cast.
+            let family = unsafe { (*entry.ifa_addr).sa_family as libc::c_int };
+            if entry_name == name && family == libc::AF_PACKET {
+                // SAFETY: AF_PACKET entries use sockaddr_ll.
+                let address = unsafe { &*(entry.ifa_addr.cast::<libc::sockaddr_ll>()) };
+                let (index, mac) = ethernet_packet_metadata(name, address)?;
+                let flags = entry.ifa_flags as libc::c_int;
+                return Ok(InterfaceSnapshot {
+                    name: entry_name.into_owned(),
+                    index,
+                    mac,
+                    up: flags & libc::IFF_UP != 0,
+                    running: flags & libc::IFF_RUNNING != 0,
+                    loopback: flags & libc::IFF_LOOPBACK != 0,
+                });
+            }
+        }
+        current = entry.ifa_next;
+    }
+    Err(other(format!("Linux interface {name:?} was not found")))
+}
+
+fn ethernet_packet_metadata(
+    name: &str,
+    address: &libc::sockaddr_ll,
+) -> Result<(i32, MacAddress), TransportError> {
+    if address.sll_hatype != libc::ARPHRD_ETHER {
+        return Err(other(format!("interface {name} is not Ethernet hardware")));
+    }
+    if address.sll_halen != 6 {
+        return Err(other(format!(
+            "interface {name} does not have a 6-byte Ethernet address"
+        )));
+    }
+    if address.sll_ifindex <= 0 {
+        return Err(other(format!(
+            "interface {name} has invalid index {}",
+            address.sll_ifindex
+        )));
+    }
+    Ok((
+        address.sll_ifindex,
+        MacAddress::new(address.sll_addr[..6].try_into().expect("six bytes")),
+    ))
+}
+
+struct IfAddrsGuard(*mut libc::ifaddrs);
+
+impl Drop for IfAddrsGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this pointer came from successful getifaddrs and has not
+            // been freed elsewhere.
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+}
+
+struct PacketSocket(RawFd);
+
+impl PacketSocket {
+    fn close(&mut self) -> io::Result<()> {
+        self.close_with(close_descriptor)
+    }
+
+    fn close_with(&mut self, close: impl FnOnce(RawFd) -> io::Result<()>) -> io::Result<()> {
+        let descriptor = mem::replace(&mut self.0, -1);
+        if descriptor < 0 {
+            return Ok(());
+        }
+        close(descriptor)
+    }
+}
+
+impl Drop for PacketSocket {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+pub struct LinuxRawEthernetTransport {
+    socket: PacketSocket,
+    config: RawEthernetConfig,
+    interface_index: i32,
+    ring: BoundedPacketRing<ReceivedFrame>,
+    statistics: TransportStatistics,
+    receive_ready: bool,
+    closed: bool,
+    next_ipv4_identification: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LinuxFrameDisposition {
+    IgnoredOutgoing,
+    IgnoredNonIpv4,
+    Parsed(FrameDisposition),
+}
+
+fn classify_received_frame(
+    frame: &[u8],
+    packet_type: libc::c_uchar,
+    config: &RawEthernetConfig,
+) -> LinuxFrameDisposition {
+    if packet_type == libc::PACKET_OUTGOING || packet_type == libc::PACKET_LOOPBACK {
+        return LinuxFrameDisposition::IgnoredOutgoing;
+    }
+    if frame.len() >= MINIMUM_IPV4_UDP_FRAME_BYTES {
+        let ether_type = u16::from_be_bytes([frame[12], frame[13]]);
+        if ether_type != ETHERTYPE_IPV4 {
+            return LinuxFrameDisposition::IgnoredNonIpv4;
+        }
+    }
+    LinuxFrameDisposition::Parsed(parse_udp_frame(frame, config))
+}
+
+fn received_packet_type(
+    address: &libc::sockaddr_ll,
+    address_length: libc::socklen_t,
+    expected_interface_index: i32,
+) -> Result<libc::c_uchar, TransportError> {
+    if (address_length as usize) < mem::size_of::<libc::sockaddr_ll>() {
+        return Err(other(format!(
+            "AF_PACKET receive returned short sockaddr_ll length {address_length}"
+        )));
+    }
+    if address.sll_family != libc::AF_PACKET as libc::c_ushort {
+        return Err(other(format!(
+            "AF_PACKET receive returned family {}",
+            address.sll_family
+        )));
+    }
+    if address.sll_ifindex != expected_interface_index {
+        return Err(other(format!(
+            "AF_PACKET receive returned interface index {}; expected {expected_interface_index}",
+            address.sll_ifindex
+        )));
+    }
+    if address.sll_pkttype > libc::PACKET_LOOPBACK {
+        return Err(other(format!(
+            "AF_PACKET receive returned packet type {}",
+            address.sll_pkttype
+        )));
+    }
+    Ok(address.sll_pkttype)
+}
+
+impl LinuxRawEthernetTransport {
+    pub fn open(config: RawEthernetConfig) -> Result<Self, TransportError> {
+        config
+            .validate()
+            .map_err(|error| other(error.to_string()))?;
+        let snapshot = inspect_interface(config.interface_name())?;
+        snapshot.validate_for(&config)?;
+
+        let protocol = i32::from((libc::ETH_P_ALL as u16).to_be());
+        // SAFETY: socket arguments are Linux AF_PACKET constants and no
+        // pointers cross this call.
+        let descriptor = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                protocol,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_os_error(
+                "opening AF_PACKET socket (CAP_NET_RAW is required)",
+            ));
+        }
+        let socket = PacketSocket(descriptor);
+        let address = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as libc::c_ushort,
+            sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
+            sll_ifindex: snapshot.index,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 6,
+            sll_addr: {
+                let mut bytes = [0_u8; 8];
+                bytes[..6].copy_from_slice(&config.host().mac().octets());
+                bytes
+            },
+        };
+        // SAFETY: `address` is a fully initialized sockaddr_ll and the size
+        // passed to bind matches its concrete type.
+        let bind_result = unsafe {
+            libc::bind(
+                socket.0,
+                (&raw const address).cast::<libc::sockaddr>(),
+                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            )
+        };
+        if bind_result != 0 {
+            return Err(last_os_error("binding AF_PACKET socket"));
+        }
+
+        let receive_buffer_bytes = socket_receive_buffer(socket.0)?;
+        let ring_capacity = config.ring_capacity();
+        Ok(Self {
+            socket,
+            config,
+            interface_index: snapshot.index,
+            ring: BoundedPacketRing::new(ring_capacity)?,
+            statistics: TransportStatistics {
+                queue_capacity: ring_capacity,
+                receive_buffer_bytes: Some(receive_buffer_bytes),
+                ..TransportStatistics::default()
+            },
+            receive_ready: false,
+            closed: false,
+            next_ipv4_identification: 0,
+        })
+    }
+
+    pub fn interface_snapshot(&self) -> Result<InterfaceSnapshot, TransportError> {
+        inspect_interface(self.config.interface_name())
+    }
+
+    fn drain_socket(&mut self, deadline: Instant) -> Result<DrainPassOutcome, TransportError> {
+        let mut buffer = [0_u8; MAXIMUM_FRAME_BYTES];
+        let outcome = drain_pass(deadline, Instant::now, || {
+            let mut address: libc::sockaddr_ll = unsafe { mem::zeroed() };
+            let mut address_length = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            // SAFETY: `buffer` and `address` are writable for their full
+            // reported lengths, and the socket is a live nonblocking
+            // descriptor owned by this transport.
+            let received = unsafe {
+                libc::recvfrom(
+                    self.socket.0,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                    (&raw mut address).cast::<libc::sockaddr>(),
+                    &mut address_length,
+                )
+            };
+            if received < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(false);
+                }
+                return Err(other(format!("AF_PACKET receive failed: {error}")));
+            }
+            if received == 0 {
+                return Ok(false);
+            }
+            let packet_type = received_packet_type(&address, address_length, self.interface_index)?;
+            match classify_received_frame(&buffer[..received as usize], packet_type, &self.config) {
+                LinuxFrameDisposition::IgnoredOutgoing => {
+                    self.statistics.ignored_outgoing_frames =
+                        self.statistics.ignored_outgoing_frames.saturating_add(1);
+                }
+                LinuxFrameDisposition::IgnoredNonIpv4 => {
+                    self.statistics.ignored_non_ipv4_frames =
+                        self.statistics.ignored_non_ipv4_frames.saturating_add(1);
+                }
+                LinuxFrameDisposition::Parsed(FrameDisposition::Matched { payload, sender }) => {
+                    self.statistics.received_frames =
+                        self.statistics.received_frames.saturating_add(1);
+                    self.ring.push(ReceivedFrame { payload, sender });
+                }
+                LinuxFrameDisposition::Parsed(FrameDisposition::Foreign) => {
+                    self.statistics.foreign_frames =
+                        self.statistics.foreign_frames.saturating_add(1);
+                }
+                LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(_)) => {
+                    self.statistics.invalid_frames =
+                        self.statistics.invalid_frames.saturating_add(1);
+                }
+            }
+            Ok(true)
+        })?;
+        self.statistics.dropped_frames = self.ring.dropped();
+        self.statistics.maximum_queue_depth = self.ring.maximum_depth();
+        self.refresh_kernel_statistics()?;
+        Ok(outcome)
+    }
+
+    fn refresh_kernel_statistics(&mut self) -> Result<(), TransportError> {
+        let mut packet_statistics = PacketStatistics::default();
+        let mut length = mem::size_of::<PacketStatistics>() as libc::socklen_t;
+        // SAFETY: output storage and its length are valid. Linux resets these
+        // counters after a successful PACKET_STATISTICS read, so we accumulate
+        // the reported drop count.
+        let result = unsafe {
+            libc::getsockopt(
+                self.socket.0,
+                libc::SOL_PACKET,
+                PACKET_STATISTICS,
+                (&raw mut packet_statistics).cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(last_os_error("reading PACKET_STATISTICS"));
+        }
+        self.statistics.kernel_dropped_frames = self
+            .statistics
+            .kernel_dropped_frames
+            .saturating_add(u64::from(packet_statistics.tp_drops));
+        Ok(())
+    }
+
+    fn close_with(
+        &mut self,
+        close_socket: impl FnOnce(RawFd) -> io::Result<()>,
+    ) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        let statistics_result = if self.receive_ready {
+            self.refresh_kernel_statistics()
+        } else {
+            Ok(())
+        };
+        let close_result = self
+            .socket
+            .close_with(close_socket)
+            .map_err(|error| other(format!("closing AF_PACKET socket failed: {error}")));
+        self.closed = true;
+        self.receive_ready = false;
+        self.statistics.receive_ready = false;
+        statistics_result.and(close_result)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainPassOutcome {
+    Drained,
+    DeadlineExpired,
+    BudgetExhausted,
+}
+
+fn drain_pass(
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut receive_one: impl FnMut() -> Result<bool, TransportError>,
+) -> Result<DrainPassOutcome, TransportError> {
+    for _ in 0..RECEIVE_DRAIN_PACKET_BUDGET {
+        if now() >= deadline {
+            return Ok(DrainPassOutcome::DeadlineExpired);
+        }
+        if !receive_one()? {
+            return Ok(DrainPassOutcome::Drained);
+        }
+    }
+    Ok(DrainPassOutcome::BudgetExhausted)
+}
+
+impl Transport for LinuxRawEthernetTransport {
+    fn start_receive(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        let current = inspect_interface(self.config.interface_name())?;
+        current.validate_for(&self.config)?;
+        self.receive_ready = true;
+        self.statistics.receive_ready = true;
+        Ok(())
+    }
+
+    fn send(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if !self.receive_ready {
+            return Err(TransportError::NotReady);
+        }
+        let frame = build_udp_frame(&self.config, payload, self.next_ipv4_identification)
+            .map_err(|error| other(error.to_string()))?;
+        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
+        // SAFETY: `frame` remains live and immutable for the duration of send.
+        let sent = unsafe {
+            libc::send(
+                self.socket.0,
+                frame.as_ptr().cast(),
+                frame.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent < 0 {
+            return Err(last_os_error("sending AF_PACKET frame"));
+        }
+        if sent as usize != frame.len() {
+            return Err(other(format!(
+                "short AF_PACKET send: wrote {sent} of {} bytes",
+                frame.len()
+            )));
+        }
+        self.statistics.sent_frames = self.statistics.sent_frames.saturating_add(1);
+        Ok(())
+    }
+
+    fn receive(&mut self, deadline: Instant) -> Result<ReceivedFrame, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if !self.receive_ready {
+            return Err(TransportError::NotReady);
+        }
+        loop {
+            // Drain on every consumer call, even while the user ring still
+            // contains frames, so newly freed ring capacity is used before
+            // the kernel socket buffer can accumulate avoidable backlog.
+            if self.drain_socket(deadline)? == DrainPassOutcome::DeadlineExpired
+                || Instant::now() >= deadline
+            {
+                self.statistics.receive_timeouts =
+                    self.statistics.receive_timeouts.saturating_add(1);
+                return Err(TransportError::TimedOut);
+            }
+            if let Some(frame) = self.ring.pop() {
+                return Ok(frame);
+            }
+            let now = Instant::now();
+            let timeout = poll_timeout_milliseconds(now, deadline);
+            let mut descriptor = libc::pollfd {
+                fd: self.socket.0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: the pollfd points to one initialized descriptor.
+            let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(other(format!("AF_PACKET poll failed: {error}")));
+            }
+            if result == 0 {
+                self.statistics.receive_timeouts =
+                    self.statistics.receive_timeouts.saturating_add(1);
+                return Err(TransportError::TimedOut);
+            }
+            if descriptor.revents & libc::POLLIN != 0 {
+                continue;
+            } else if descriptor.revents != 0 {
+                return Err(other(format!(
+                    "AF_PACKET poll returned terminal events 0x{:x}",
+                    descriptor.revents
+                )));
+            }
+        }
+    }
+
+    fn statistics(&self) -> TransportStatistics {
+        self.statistics
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.close_with(close_descriptor)
+    }
+}
+
+#[derive(Default)]
+#[repr(C)]
+struct PacketStatistics {
+    tp_packets: u32,
+    tp_drops: u32,
+}
+
+fn close_descriptor(descriptor: RawFd) -> io::Result<()> {
+    // SAFETY: the descriptor is owned by the caller and invalidated before this call.
+    if unsafe { libc::close(descriptor) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn socket_receive_buffer(descriptor: RawFd) -> Result<usize, TransportError> {
+    let mut value: libc::c_int = 0;
+    let mut length = mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: output storage and its length match SO_RCVBUF's integer value.
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw mut value).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(last_os_error("reading SO_RCVBUF"));
+    }
+    usize::try_from(value).map_err(|_| other(format!("SO_RCVBUF returned {value}")))
+}
+
+fn poll_timeout_milliseconds(now: Instant, deadline: Instant) -> libc::c_int {
+    let nanos = deadline.saturating_duration_since(now).as_nanos();
+    let milliseconds = nanos.div_ceil(1_000_000).max(1);
+    i32::try_from(milliseconds).unwrap_or(i32::MAX)
+}
+
+fn last_os_error(context: &str) -> TransportError {
+    other(format!("{context}: {}", io::Error::last_os_error()))
+}
+
+fn other(message: String) -> TransportError {
+    TransportError::Other(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Endpoint, RAW_ETHERNET_CONFIG_SCHEMA_VERSION, RawEthernetEndpoint};
+    use std::net::Ipv4Addr;
+
+    const ETHERNET_HEADER_BYTES: usize = 14;
+
+    fn config() -> RawEthernetConfig {
+        RawEthernetConfig::new(
+            RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+            "eth0",
+            RawEthernetEndpoint::new(
+                MacAddress::new([0x02, 0, 0, 0, 0, 1]),
+                Endpoint::new(Ipv4Addr::new(169, 254, 209, 1), 49_152).expect("host"),
+            )
+            .expect("host endpoint"),
+            RawEthernetEndpoint::new(
+                MacAddress::new([0x02, 0, 0, 0, 0, 0x7a]),
+                Endpoint::new(Ipv4Addr::new(169, 254, 209, 0), 24_576).expect("board"),
+            )
+            .expect("board endpoint"),
+            8,
+        )
+        .expect("config")
+    }
+
+    fn board_to_host_frame(payload: &[u8]) -> Vec<u8> {
+        let config = config();
+        let reverse = RawEthernetConfig::new(
+            RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+            config.interface_name(),
+            config.board(),
+            config.host(),
+            config.ring_capacity(),
+        )
+        .expect("reverse config");
+        build_udp_frame(&reverse, payload, 7).expect("board-to-host frame")
+    }
+
+    fn packet_address() -> libc::sockaddr_ll {
+        libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as libc::c_ushort,
+            sll_protocol: 0,
+            sll_ifindex: 2,
+            sll_hatype: libc::ARPHRD_ETHER,
+            sll_pkttype: 0,
+            sll_halen: 6,
+            sll_addr: [0x02, 0, 0, 0, 0, 1, 0, 0],
+        }
+    }
+
+    #[test]
+    fn packet_metadata_requires_ethernet_six_bytes_and_positive_index() {
+        let valid = packet_address();
+        assert_eq!(
+            ethernet_packet_metadata("eth0", &valid).expect("valid Ethernet metadata"),
+            (2, MacAddress::new([0x02, 0, 0, 0, 0, 1]))
+        );
+
+        let mut wrong_type = valid;
+        wrong_type.sll_hatype = libc::ARPHRD_LOOPBACK;
+        assert!(ethernet_packet_metadata("eth0", &wrong_type).is_err());
+
+        let mut wrong_length = valid;
+        wrong_length.sll_halen = 8;
+        assert!(ethernet_packet_metadata("eth0", &wrong_length).is_err());
+
+        let mut wrong_index = valid;
+        wrong_index.sll_ifindex = 0;
+        assert!(ethernet_packet_metadata("eth0", &wrong_index).is_err());
+    }
+
+    #[test]
+    fn receive_metadata_requires_complete_packet_identity() {
+        let valid = packet_address();
+        let length = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+        assert_eq!(
+            received_packet_type(&valid, length, 2).expect("valid receive metadata"),
+            libc::PACKET_HOST
+        );
+        assert!(received_packet_type(&valid, length - 1, 2).is_err());
+
+        let mut wrong_family = valid;
+        wrong_family.sll_family = libc::AF_INET as libc::c_ushort;
+        assert!(received_packet_type(&wrong_family, length, 2).is_err());
+
+        let mut wrong_index = valid;
+        wrong_index.sll_ifindex = 3;
+        assert!(received_packet_type(&wrong_index, length, 2).is_err());
+
+        let mut wrong_type = valid;
+        wrong_type.sll_pkttype = libc::PACKET_LOOPBACK + 1;
+        assert!(received_packet_type(&wrong_type, length, 2).is_err());
+    }
+
+    #[test]
+    fn receive_classifier_separates_ignored_and_integrity_frames() {
+        let config = config();
+        let matched = board_to_host_frame(b"telemetry");
+        for packet_type in [libc::PACKET_OUTGOING, libc::PACKET_LOOPBACK] {
+            assert_eq!(
+                classify_received_frame(&matched, packet_type, &config),
+                LinuxFrameDisposition::IgnoredOutgoing
+            );
+        }
+
+        for ether_type in [0x0806_u16, 0x86dd] {
+            let mut link_frame = vec![0_u8; 60];
+            link_frame[12..14].copy_from_slice(&ether_type.to_be_bytes());
+            assert_eq!(
+                classify_received_frame(&link_frame, libc::PACKET_HOST, &config),
+                LinuxFrameDisposition::IgnoredNonIpv4
+            );
+        }
+
+        assert!(matches!(
+            classify_received_frame(&matched, libc::PACKET_HOST, &config),
+            LinuxFrameDisposition::Parsed(FrameDisposition::Matched { payload, .. })
+                if payload == b"telemetry"
+        ));
+
+        let mut foreign = matched.clone();
+        foreign[6] ^= 1;
+        assert_eq!(
+            classify_received_frame(&foreign, libc::PACKET_HOST, &config),
+            LinuxFrameDisposition::Parsed(FrameDisposition::Foreign)
+        );
+
+        let mut malformed = matched;
+        malformed[24] ^= 1;
+        assert!(matches!(
+            classify_received_frame(&malformed, libc::PACKET_HOST, &config),
+            LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(_))
+        ));
+        for short_length in [8, ETHERNET_HEADER_BYTES, MINIMUM_IPV4_UDP_FRAME_BYTES - 1] {
+            let mut short = vec![0_u8; short_length];
+            if short_length >= ETHERNET_HEADER_BYTES {
+                short[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
+            }
+            assert!(matches!(
+                classify_received_frame(&short, libc::PACKET_HOST, &config),
+                LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn drain_pass_honors_deadline_and_packet_budget() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let mut received = 0;
+        assert_eq!(
+            drain_pass(
+                deadline,
+                Instant::now,
+                || -> Result<bool, TransportError> {
+                    received += 1;
+                    Ok(true)
+                },
+            )
+            .expect("bounded pass"),
+            DrainPassOutcome::BudgetExhausted
+        );
+        assert_eq!(received, RECEIVE_DRAIN_PACKET_BUDGET);
+
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_millis(1);
+        let mut times = [start, deadline].into_iter();
+        let mut received = 0;
+        assert_eq!(
+            drain_pass(
+                deadline,
+                || times.next().expect("deadline checked before each receive"),
+                || -> Result<bool, TransportError> {
+                    received += 1;
+                    Ok(true)
+                },
+            )
+            .expect("deadline pass"),
+            DrainPassOutcome::DeadlineExpired
+        );
+        assert_eq!(received, 1);
+
+        let mut received = 0;
+        assert_eq!(
+            drain_pass(
+                deadline,
+                || deadline,
+                || -> Result<bool, TransportError> {
+                    received += 1;
+                    Ok(true)
+                },
+            )
+            .expect("expired pass"),
+            DrainPassOutcome::DeadlineExpired
+        );
+        assert_eq!(received, 0);
+    }
+
+    fn transport_with_descriptor(
+        descriptor: RawFd,
+        receive_ready: bool,
+    ) -> LinuxRawEthernetTransport {
+        let config = config();
+        LinuxRawEthernetTransport {
+            socket: PacketSocket(descriptor),
+            interface_index: 2,
+            ring: BoundedPacketRing::new(config.ring_capacity()).expect("ring"),
+            statistics: TransportStatistics {
+                receive_ready,
+                queue_capacity: config.ring_capacity(),
+                ..TransportStatistics::default()
+            },
+            config,
+            receive_ready,
+            closed: false,
+            next_ipv4_identification: 0,
+        }
+    }
+
+    #[test]
+    fn close_invalidates_socket_once_and_closes_after_errors() {
+        let mut transport = transport_with_descriptor(i32::MAX, true);
+        let mut close_calls = 0;
+        let error = transport
+            .close_with(|_| {
+                close_calls += 1;
+                Err(io::Error::other("injected close failure"))
+            })
+            .expect_err("statistics failure wins");
+        assert!(error.to_string().contains("PACKET_STATISTICS"));
+        assert_eq!(close_calls, 1);
+        assert_eq!(transport.socket.0, -1);
+        assert!(transport.closed);
+        assert!(!transport.receive_ready);
+        assert!(!transport.statistics.receive_ready);
+
+        transport
+            .close_with(|_| {
+                close_calls += 1;
+                Ok(())
+            })
+            .expect("second close is idempotent");
+        assert_eq!(close_calls, 1);
+        assert_eq!(transport.start_receive(), Err(TransportError::Closed));
+        assert_eq!(transport.send(&[]), Err(TransportError::Closed));
+        assert_eq!(
+            transport.receive(Instant::now()),
+            Err(TransportError::Closed)
+        );
+
+        let mut transport = transport_with_descriptor(i32::MAX, false);
+        let error = transport
+            .close_with(|_| Err(io::Error::other("injected close failure")))
+            .expect_err("close failure");
+        assert!(error.to_string().contains("injected close failure"));
+        assert!(transport.closed);
+        assert_eq!(transport.socket.0, -1);
+    }
+}

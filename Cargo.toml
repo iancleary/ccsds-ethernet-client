@@ -1,0 +1,14 @@
+[package]
+name = "ccsds-ethernet-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Ian Cleary <iancleary@hey.com>"]
+description = "Typed in-process CCSDS raw-Ethernet client"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/iancleary/ccsds-ethernet-client"
+publish = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
