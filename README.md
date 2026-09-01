@@ -36,6 +36,13 @@ root.
 just check
 ```
 
+## Maintenance
+
+Future agent and maintainer workflow guidance lives in
+[`docs/agent-operating-loop.md`](docs/agent-operating-loop.md). Use it to keep
+changes aligned with the crate's transport-only boundary and executable test
+contracts.
+
 ## Scope boundary
 
 Mission APIDs, secondary headers, request-ID allocation, acknowledgement
