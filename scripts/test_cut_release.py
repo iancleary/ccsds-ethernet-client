@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cut_release  # noqa: E402
 
-VERSION = "v0.1.0"
+VERSION = "v0.1.1"
 SHA = "a" * 40
 CANONICAL_ORIGIN = "git@github.com:iancleary/ccsds-ethernet-client.git"
 
@@ -88,7 +88,7 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(cut_release.package_version(), VERSION)
 
     def test_parse_version_is_ascii_semver(self) -> None:
-        self.assertEqual(cut_release.parse_version(VERSION), (0, 1, 0))
+        self.assertEqual(cut_release.parse_version(VERSION), (0, 1, 1))
         invalid = (
             "0.1.0",
             "v0.1",

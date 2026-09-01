@@ -12,8 +12,8 @@ invoked through `just`:
 ```sh
 just cut-release --print-current-version
 just cut-release --print-next-version
-just cut-release --version v0.1.0 --notes-file /path/to/notes.md --dry-run
-just cut-release --version v0.1.0 --notes-file /path/to/notes.md
+just cut-release --version v0.1.1 --notes-file /path/to/notes.md --dry-run
+just cut-release --version v0.1.1 --notes-file /path/to/notes.md
 ```
 
 The two print commands are read-only: they verify the canonical `origin`, then
