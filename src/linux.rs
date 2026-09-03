@@ -252,6 +252,26 @@ fn record_parse_error(counters: &mut FrameClassificationStatistics, error: &Ethe
     saturating_increment(counter);
 }
 
+fn record_parsed_frame(statistics: &mut TransportStatistics, disposition: &FrameDisposition) {
+    match disposition {
+        FrameDisposition::Matched { .. } => {
+            saturating_increment(&mut statistics.received_frames);
+        }
+        FrameDisposition::Foreign => {
+            saturating_increment(&mut statistics.foreign_frames);
+            saturating_increment(&mut statistics.frame_classification.endpoint_mismatch_frames);
+        }
+        FrameDisposition::Invalid(error @ EthernetError::UnsupportedEtherType(_)) => {
+            saturating_increment(&mut statistics.ignored_non_ipv4_frames);
+            record_parse_error(&mut statistics.frame_classification, error);
+        }
+        FrameDisposition::Invalid(error) => {
+            saturating_increment(&mut statistics.invalid_frames);
+            record_parse_error(&mut statistics.frame_classification, error);
+        }
+    }
+}
+
 fn received_packet_type(
     address: &libc::sockaddr_ll,
     address_length: libc::socklen_t,
@@ -383,25 +403,11 @@ impl LinuxRawEthernetTransport {
                 LinuxFrameDisposition::IgnoredOutgoing => {
                     saturating_increment(&mut self.statistics.ignored_outgoing_frames);
                 }
-                LinuxFrameDisposition::Parsed(FrameDisposition::Matched { payload, sender }) => {
-                    saturating_increment(&mut self.statistics.received_frames);
-                    self.ring.push(ReceivedFrame { payload, sender });
-                }
-                LinuxFrameDisposition::Parsed(FrameDisposition::Foreign) => {
-                    saturating_increment(&mut self.statistics.foreign_frames);
-                    saturating_increment(
-                        &mut self
-                            .statistics
-                            .frame_classification
-                            .endpoint_mismatch_frames,
-                    );
-                }
-                LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(error)) => {
-                    saturating_increment(&mut self.statistics.invalid_frames);
-                    if matches!(error, EthernetError::UnsupportedEtherType(_)) {
-                        saturating_increment(&mut self.statistics.ignored_non_ipv4_frames);
+                LinuxFrameDisposition::Parsed(disposition) => {
+                    record_parsed_frame(&mut self.statistics, &disposition);
+                    if let FrameDisposition::Matched { payload, sender } = disposition {
+                        self.ring.push(ReceivedFrame { payload, sender });
                     }
-                    record_parse_error(&mut self.statistics.frame_classification, &error);
                 }
             }
             Ok(true)
@@ -835,6 +841,54 @@ mod tests {
         statistics.frame_classification.packet_host_frames = u64::MAX;
         record_packet_type(&mut statistics, libc::PACKET_HOST);
         assert_eq!(statistics.frame_classification.packet_host_frames, u64::MAX);
+    }
+
+    #[test]
+    fn parsed_frame_accounting_preserves_unsupported_ethertype_aggregate() {
+        let mut statistics = TransportStatistics::default();
+        record_parsed_frame(
+            &mut statistics,
+            &FrameDisposition::Invalid(EthernetError::UnsupportedEtherType(0x0806)),
+        );
+
+        assert_eq!(statistics.ignored_non_ipv4_frames, 1);
+        assert_eq!(
+            statistics.frame_classification.unsupported_ethertype_frames,
+            1
+        );
+        assert_eq!(statistics.invalid_frames, 0);
+        assert_eq!(statistics.received_frames, 0);
+
+        statistics.ignored_non_ipv4_frames = u64::MAX;
+        statistics.frame_classification.unsupported_ethertype_frames = u64::MAX;
+        record_parsed_frame(
+            &mut statistics,
+            &FrameDisposition::Invalid(EthernetError::UnsupportedEtherType(0x86dd)),
+        );
+        assert_eq!(statistics.ignored_non_ipv4_frames, u64::MAX);
+        assert_eq!(
+            statistics.frame_classification.unsupported_ethertype_frames,
+            u64::MAX
+        );
+        assert_eq!(statistics.invalid_frames, 0);
+    }
+
+    #[test]
+    fn parsed_frame_accounting_keeps_real_parse_failures_invalid() {
+        let mut statistics = TransportStatistics::default();
+        record_parsed_frame(
+            &mut statistics,
+            &FrameDisposition::Invalid(EthernetError::InvalidIpv4Checksum),
+        );
+
+        assert_eq!(statistics.invalid_frames, 1);
+        assert_eq!(
+            statistics
+                .frame_classification
+                .invalid_ipv4_checksum_failures,
+            1
+        );
+        assert_eq!(statistics.ignored_non_ipv4_frames, 0);
     }
 
     #[test]
