@@ -11,15 +11,29 @@ use std::os::fd::RawFd;
 use std::ptr;
 use std::time::Instant;
 
+#[rustfmt::skip]
 use crate::ethernet::{
-    FrameDisposition, MacAddress, RawEthernetConfig, build_udp_frame, parse_udp_frame,
+    ETHERNET_HEADER_BYTES,
+    EthernetError,
+    FrameDisposition,
+    IpPacketOptions,
+    MacAddress,
+    RawEthernetConfig,
+    build_udp_frame,
+    parse_udp_frame,
 };
+#[rustfmt::skip]
 use crate::transport::{
-    BoundedPacketRing, ReceivedFrame, Transport, TransportError, TransportStatistics,
+    BoundedPacketRing,
+    FrameClassificationStatistics,
+    ReceivedFrame,
+    Transport,
+    TransportError,
+    TransportStatistics,
 };
 
 const PACKET_STATISTICS: libc::c_int = 6;
-const ETHERTYPE_IPV4: u16 = 0x0800;
+#[cfg(test)]
 const MINIMUM_IPV4_UDP_FRAME_BYTES: usize = 42;
 const MAXIMUM_FRAME_BYTES: usize = 2048;
 const RECEIVE_DRAIN_PACKET_BUDGET: usize = 64;
@@ -178,7 +192,6 @@ pub struct LinuxRawEthernetTransport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LinuxFrameDisposition {
     IgnoredOutgoing,
-    IgnoredNonIpv4,
     Parsed(FrameDisposition),
 }
 
@@ -190,13 +203,53 @@ fn classify_received_frame(
     if packet_type == libc::PACKET_OUTGOING || packet_type == libc::PACKET_LOOPBACK {
         return LinuxFrameDisposition::IgnoredOutgoing;
     }
-    if frame.len() >= MINIMUM_IPV4_UDP_FRAME_BYTES {
-        let ether_type = u16::from_be_bytes([frame[12], frame[13]]);
-        if ether_type != ETHERTYPE_IPV4 {
-            return LinuxFrameDisposition::IgnoredNonIpv4;
-        }
-    }
     LinuxFrameDisposition::Parsed(parse_udp_frame(frame, config))
+}
+
+fn saturating_increment(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
+fn record_packet_type(statistics: &mut TransportStatistics, packet_type: libc::c_uchar) {
+    let counters = &mut statistics.frame_classification;
+    let counter = match packet_type {
+        libc::PACKET_HOST => &mut counters.packet_host_frames,
+        libc::PACKET_BROADCAST => &mut counters.packet_broadcast_frames,
+        libc::PACKET_MULTICAST => &mut counters.packet_multicast_frames,
+        libc::PACKET_OTHERHOST => &mut counters.packet_other_host_frames,
+        libc::PACKET_OUTGOING => &mut counters.packet_outgoing_frames,
+        libc::PACKET_LOOPBACK => &mut counters.packet_loopback_frames,
+        _ => &mut counters.packet_unknown_frames,
+    };
+    saturating_increment(counter);
+}
+
+fn record_parse_error(counters: &mut FrameClassificationStatistics, error: &EthernetError) {
+    let counter = match error {
+        EthernetError::FrameTooShort(size) if *size < ETHERNET_HEADER_BYTES => {
+            &mut counters.ethernet_header_too_short_frames
+        }
+        EthernetError::UnsupportedEtherType(_) => &mut counters.unsupported_ethertype_frames,
+        EthernetError::FrameTooShort(_) => &mut counters.frame_too_short_failures,
+        EthernetError::InvalidIpv4Header | EthernetError::PayloadTooLarge(_) => {
+            &mut counters.invalid_ipv4_header_failures
+        }
+        EthernetError::FragmentedIpv4 => &mut counters.fragmented_ipv4_failures,
+        EthernetError::InvalidIpv4Checksum => &mut counters.invalid_ipv4_checksum_failures,
+        EthernetError::InvalidIpv6Header => &mut counters.invalid_ipv6_header_failures,
+        EthernetError::UnsupportedIpv6ExtensionHeader(_) => {
+            &mut counters.unsupported_ipv6_extension_header_failures
+        }
+        EthernetError::InvalidIpv6PayloadLength => {
+            &mut counters.invalid_ipv6_payload_length_failures
+        }
+        EthernetError::MissingIpv6UdpChecksum => &mut counters.missing_ipv6_udp_checksum_failures,
+        EthernetError::InvalidIpv6UdpChecksum => &mut counters.invalid_ipv6_udp_checksum_failures,
+        EthernetError::InvalidUdpLength => &mut counters.invalid_udp_length_failures,
+        EthernetError::InvalidUdpChecksum => &mut counters.invalid_udp_checksum_failures,
+        _ => return,
+    };
+    saturating_increment(counter);
 }
 
 fn received_packet_type(
@@ -219,12 +272,6 @@ fn received_packet_type(
         return Err(other(format!(
             "AF_PACKET receive returned interface index {}; expected {expected_interface_index}",
             address.sll_ifindex
-        )));
-    }
-    if address.sll_pkttype > libc::PACKET_LOOPBACK {
-        return Err(other(format!(
-            "AF_PACKET receive returned packet type {}",
-            address.sll_pkttype
         )));
     }
     Ok(address.sll_pkttype)
@@ -331,27 +378,30 @@ impl LinuxRawEthernetTransport {
                 return Ok(false);
             }
             let packet_type = received_packet_type(&address, address_length, self.interface_index)?;
+            record_packet_type(&mut self.statistics, packet_type);
             match classify_received_frame(&buffer[..received as usize], packet_type, &self.config) {
                 LinuxFrameDisposition::IgnoredOutgoing => {
-                    self.statistics.ignored_outgoing_frames =
-                        self.statistics.ignored_outgoing_frames.saturating_add(1);
-                }
-                LinuxFrameDisposition::IgnoredNonIpv4 => {
-                    self.statistics.ignored_non_ipv4_frames =
-                        self.statistics.ignored_non_ipv4_frames.saturating_add(1);
+                    saturating_increment(&mut self.statistics.ignored_outgoing_frames);
                 }
                 LinuxFrameDisposition::Parsed(FrameDisposition::Matched { payload, sender }) => {
-                    self.statistics.received_frames =
-                        self.statistics.received_frames.saturating_add(1);
+                    saturating_increment(&mut self.statistics.received_frames);
                     self.ring.push(ReceivedFrame { payload, sender });
                 }
                 LinuxFrameDisposition::Parsed(FrameDisposition::Foreign) => {
-                    self.statistics.foreign_frames =
-                        self.statistics.foreign_frames.saturating_add(1);
+                    saturating_increment(&mut self.statistics.foreign_frames);
+                    saturating_increment(
+                        &mut self
+                            .statistics
+                            .frame_classification
+                            .endpoint_mismatch_frames,
+                    );
                 }
-                LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(_)) => {
-                    self.statistics.invalid_frames =
-                        self.statistics.invalid_frames.saturating_add(1);
+                LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(error)) => {
+                    saturating_increment(&mut self.statistics.invalid_frames);
+                    if matches!(error, EthernetError::UnsupportedEtherType(_)) {
+                        saturating_increment(&mut self.statistics.ignored_non_ipv4_frames);
+                    }
+                    record_parse_error(&mut self.statistics.frame_classification, &error);
                 }
             }
             Ok(true)
@@ -452,9 +502,15 @@ impl Transport for LinuxRawEthernetTransport {
         if !self.receive_ready {
             return Err(TransportError::NotReady);
         }
-        let frame = build_udp_frame(&self.config, payload, self.next_ipv4_identification)
+        let options = if self.config.host().network().as_ipv4().is_some() {
+            let identification = self.next_ipv4_identification;
+            self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
+            IpPacketOptions::Ipv4 { identification }
+        } else {
+            IpPacketOptions::Ipv6
+        };
+        let frame = build_udp_frame(&self.config, payload, options)
             .map_err(|error| other(error.to_string()))?;
-        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
         // SAFETY: `frame` remains live and immutable for the duration of send.
         let sent = unsafe {
             libc::send(
@@ -591,7 +647,13 @@ fn other(message: String) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Endpoint, RAW_ETHERNET_CONFIG_SCHEMA_VERSION, RawEthernetEndpoint};
+    #[rustfmt::skip]
+    use crate::{
+        Endpoint,
+        IpPacketOptions,
+        RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+        RawEthernetEndpoint,
+    };
     use std::net::Ipv4Addr;
 
     const ETHERNET_HEADER_BYTES: usize = 14;
@@ -625,7 +687,12 @@ mod tests {
             config.ring_capacity(),
         )
         .expect("reverse config");
-        build_udp_frame(&reverse, payload, 7).expect("board-to-host frame")
+        build_udp_frame(
+            &reverse,
+            payload,
+            IpPacketOptions::Ipv4 { identification: 7 },
+        )
+        .expect("board-to-host frame")
     }
 
     fn packet_address() -> libc::sockaddr_ll {
@@ -679,9 +746,12 @@ mod tests {
         wrong_index.sll_ifindex = 3;
         assert!(received_packet_type(&wrong_index, length, 2).is_err());
 
-        let mut wrong_type = valid;
-        wrong_type.sll_pkttype = libc::PACKET_LOOPBACK + 1;
-        assert!(received_packet_type(&wrong_type, length, 2).is_err());
+        let mut unknown_type = valid;
+        unknown_type.sll_pkttype = libc::PACKET_LOOPBACK + 1;
+        assert_eq!(
+            received_packet_type(&unknown_type, length, 2).expect("unknown type is counted"),
+            libc::PACKET_LOOPBACK + 1
+        );
     }
 
     #[test]
@@ -698,10 +768,12 @@ mod tests {
         for ether_type in [0x0806_u16, 0x86dd] {
             let mut link_frame = vec![0_u8; 60];
             link_frame[12..14].copy_from_slice(&ether_type.to_be_bytes());
-            assert_eq!(
+            assert!(matches!(
                 classify_received_frame(&link_frame, libc::PACKET_HOST, &config),
-                LinuxFrameDisposition::IgnoredNonIpv4
-            );
+                LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(
+                    EthernetError::UnsupportedEtherType(value)
+                )) if value == ether_type
+            ));
         }
 
         assert!(matches!(
@@ -721,7 +793,9 @@ mod tests {
         malformed[24] ^= 1;
         assert!(matches!(
             classify_received_frame(&malformed, libc::PACKET_HOST, &config),
-            LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(_))
+            LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(
+                EthernetError::InvalidIpv4Checksum
+            ))
         ));
         for short_length in [8, ETHERNET_HEADER_BYTES, MINIMUM_IPV4_UDP_FRAME_BYTES - 1] {
             let mut short = vec![0_u8; short_length];
@@ -733,6 +807,102 @@ mod tests {
                 LinuxFrameDisposition::Parsed(FrameDisposition::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn packet_type_accounting_counts_known_and_unknown_values() {
+        let mut statistics = TransportStatistics::default();
+        for packet_type in [
+            libc::PACKET_HOST,
+            libc::PACKET_BROADCAST,
+            libc::PACKET_MULTICAST,
+            libc::PACKET_OTHERHOST,
+            libc::PACKET_OUTGOING,
+            libc::PACKET_LOOPBACK,
+            libc::PACKET_LOOPBACK + 1,
+        ] {
+            record_packet_type(&mut statistics, packet_type);
+        }
+
+        assert_eq!(statistics.frame_classification.packet_host_frames, 1);
+        assert_eq!(statistics.frame_classification.packet_broadcast_frames, 1);
+        assert_eq!(statistics.frame_classification.packet_multicast_frames, 1);
+        assert_eq!(statistics.frame_classification.packet_other_host_frames, 1);
+        assert_eq!(statistics.frame_classification.packet_outgoing_frames, 1);
+        assert_eq!(statistics.frame_classification.packet_loopback_frames, 1);
+        assert_eq!(statistics.frame_classification.packet_unknown_frames, 1);
+
+        statistics.frame_classification.packet_host_frames = u64::MAX;
+        record_packet_type(&mut statistics, libc::PACKET_HOST);
+        assert_eq!(statistics.frame_classification.packet_host_frames, u64::MAX);
+    }
+
+    #[test]
+    fn parse_error_accounting_records_factual_reasons_and_saturates() {
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::FrameTooShort(8));
+        assert_eq!(counters.ethernet_header_too_short_frames, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::UnsupportedEtherType(0x0806));
+        assert_eq!(counters.unsupported_ethertype_frames, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(
+            &mut counters,
+            &EthernetError::FrameTooShort(ETHERNET_HEADER_BYTES),
+        );
+        assert_eq!(counters.frame_too_short_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidIpv4Header);
+        assert_eq!(counters.invalid_ipv4_header_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::FragmentedIpv4);
+        assert_eq!(counters.fragmented_ipv4_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidIpv4Checksum);
+        assert_eq!(counters.invalid_ipv4_checksum_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidIpv6Header);
+        assert_eq!(counters.invalid_ipv6_header_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(
+            &mut counters,
+            &EthernetError::UnsupportedIpv6ExtensionHeader(0),
+        );
+        assert_eq!(counters.unsupported_ipv6_extension_header_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidIpv6PayloadLength);
+        assert_eq!(counters.invalid_ipv6_payload_length_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::MissingIpv6UdpChecksum);
+        assert_eq!(counters.missing_ipv6_udp_checksum_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidIpv6UdpChecksum);
+        assert_eq!(counters.invalid_ipv6_udp_checksum_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidUdpLength);
+        assert_eq!(counters.invalid_udp_length_failures, 1);
+
+        let mut counters = FrameClassificationStatistics::default();
+        record_parse_error(&mut counters, &EthernetError::InvalidUdpChecksum);
+        assert_eq!(counters.invalid_udp_checksum_failures, 1);
+
+        let mut counters = FrameClassificationStatistics {
+            invalid_ipv4_checksum_failures: u64::MAX,
+            ..FrameClassificationStatistics::default()
+        };
+        record_parse_error(&mut counters, &EthernetError::InvalidIpv4Checksum);
+        assert_eq!(counters.invalid_ipv4_checksum_failures, u64::MAX);
     }
 
     #[test]

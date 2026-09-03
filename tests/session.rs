@@ -1,6 +1,11 @@
 use std::error::Error as _;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::net::Ipv4Addr;
+#[rustfmt::skip]
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use ccsds_ethernet_client::{
     Codec, DecodeResult, DecodedMessage, EncodedCommand, Endpoint, ExchangeError, MemoryTransport,
@@ -76,7 +81,7 @@ impl Codec for TestCodec {
 }
 
 fn remote() -> Endpoint {
-    Endpoint::new("169.254.209.0".parse().expect("IP"), 24_576).expect("endpoint")
+    Endpoint::new("169.254.209.0".parse::<Ipv4Addr>().expect("IP"), 24_576).expect("endpoint")
 }
 
 fn frame(payload: &[u8]) -> Result<ReceivedFrame, TransportError> {

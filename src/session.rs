@@ -3,7 +3,14 @@ use std::error::Error;
 use std::fmt;
 use std::time::Instant;
 
-use crate::{Endpoint, ReceivedFrame, Transport, TransportError, TransportStatistics};
+#[rustfmt::skip]
+use crate::{
+    Endpoint,
+    ReceivedFrame,
+    Transport,
+    TransportError,
+    TransportStatistics,
+};
 
 pub type DecodeResult<A, T, C, E> = Result<DecodedMessage<A, T, C>, E>;
 

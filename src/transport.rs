@@ -11,6 +11,33 @@ pub struct ReceivedFrame {
     pub sender: Endpoint,
 }
 
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameClassificationStatistics {
+    pub packet_host_frames: u64,
+    pub packet_broadcast_frames: u64,
+    pub packet_multicast_frames: u64,
+    pub packet_other_host_frames: u64,
+    pub packet_outgoing_frames: u64,
+    pub packet_loopback_frames: u64,
+    pub packet_unknown_frames: u64,
+    pub ethernet_header_too_short_frames: u64,
+    pub unsupported_ethertype_frames: u64,
+    pub endpoint_mismatch_frames: u64,
+    pub frame_too_short_failures: u64,
+    pub invalid_ipv4_header_failures: u64,
+    pub fragmented_ipv4_failures: u64,
+    pub invalid_ipv4_checksum_failures: u64,
+    pub invalid_ipv6_header_failures: u64,
+    pub unsupported_ipv6_extension_header_failures: u64,
+    pub invalid_ipv6_payload_length_failures: u64,
+    pub missing_ipv6_udp_checksum_failures: u64,
+    pub invalid_ipv6_udp_checksum_failures: u64,
+    pub invalid_udp_length_failures: u64,
+    pub invalid_udp_checksum_failures: u64,
+}
+
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransportStatistics {
     pub receive_ready: bool,
@@ -23,6 +50,7 @@ pub struct TransportStatistics {
     pub ignored_non_ipv4_frames: u64,
     pub invalid_frames: u64,
     pub foreign_frames: u64,
+    pub frame_classification: FrameClassificationStatistics,
     pub maximum_queue_depth: usize,
     pub queue_capacity: usize,
     pub receive_buffer_bytes: Option<usize>,
