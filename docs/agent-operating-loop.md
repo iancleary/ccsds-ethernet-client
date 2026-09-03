@@ -7,12 +7,12 @@ framework around it.
 
 ## System map
 
-- `src/ethernet.rs` owns strict raw Ethernet, IPv4, and UDP frame construction,
-  parsing, config validation, and schema-version behavior.
+- `src/ethernet.rs` owns strict raw Ethernet, IPv4, IPv6, and UDP frame
+  construction, parsing, config validation, and schema-version behavior.
 - `src/session.rs` owns command exchange lifecycle, correlation, telemetry
   buffering, close semantics, and delivery-outcome error boundaries.
 - `src/transport.rs` owns the transport trait, hardware-free memory transport,
-  packet-ring accounting, and portable test doubles.
+  packet-ring accounting, observation statistics, and portable test doubles.
 - `src/linux.rs` is the only Linux raw-socket implementation and the only
   unsafe/system-call boundary. It must stay behind `cfg(target_os = "linux")`.
 - `tests/frame_transport.rs` is the executable frame/config/ring contract.
@@ -29,12 +29,20 @@ Preserve these unless the pull request explicitly changes the public contract:
   schemas, request-ID allocation, acknowledgement status meaning, retries,
   recording schemas, actuation logic, decisions, intent, and safety policy
   belong to consuming systems.
-- `RawEthernetConfig` schema version `1` is strict: concrete unicast IPv4
-  endpoints, nonzero UDP ports, unicast nonzero MAC addresses, distinct
-  host/board identity, valid Linux interface name, and nonzero packet-ring
-  capacity.
-- Standard Ethernet MTU is the v1 payload limit. UDP payloads above
-  `STANDARD_MTU_UDP_PAYLOAD_BYTES` are rejected rather than fragmented.
+- Consumers supply every local and peer MAC address, IP address, UDP port,
+  interface name, deadline, codec, recording schema, and operational policy.
+- `RawEthernetConfig` schema version `2` is strict: concrete unicast IPv4 or
+  IPv6 endpoints, matching IP address families, nonzero UDP ports, unicast
+  nonzero MAC addresses, distinct host/board identity, valid Linux interface
+  name, and nonzero packet-ring capacity.
+- The crate must not infer, discover, select, rewrite, or learn peer addresses.
+- Standard Ethernet MTU is the configured-family payload limit. IPv4 UDP
+  payloads above `STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES` and IPv6 UDP payloads
+  above `STANDARD_MTU_IPV6_UDP_PAYLOAD_BYTES` are rejected rather than
+  fragmented.
+- Linux receive statistics are observations only. Detailed counters do not
+  imply that a consumer should accept, reject, persist, invalidate, or ignore a
+  frame for mission purposes. Ignored payload bytes are not retained.
 - The Linux transport uses an interface-bound `AF_PACKET` raw socket. Live use
   requires Linux and deployment-managed `CAP_NET_RAW`; default tests must stay
   hardware-free and root-free.
@@ -74,6 +82,7 @@ Preserve these unless the pull request explicitly changes the public contract:
 Before opening a PR, answer these locally:
 
 - Does the change keep live raw-socket behavior isolated from default tests?
+- Does the crate still avoid selecting or learning caller-owned addresses?
 - Does a post-send failure still surface as unknown delivery outcome when the
   command may have left the process?
 - Did a generic helper accidentally encode mission policy?

@@ -1,14 +1,33 @@
-use std::net::Ipv4Addr;
+#[rustfmt::skip]
+use std::net::{
+    Ipv4Addr,
+    Ipv6Addr,
+};
 use std::str::FromStr;
 
+#[rustfmt::skip]
+#[allow(deprecated)]
 use ccsds_ethernet_client::{
-    BoundedPacketRing, Endpoint, EthernetError, FrameDisposition, MacAddress,
-    RAW_ETHERNET_CONFIG_SCHEMA_VERSION, RawEthernetConfig, RawEthernetEndpoint,
-    STANDARD_MTU_UDP_PAYLOAD_BYTES, build_udp_frame, parse_udp_frame,
+    BoundedPacketRing,
+    Endpoint,
+    EthernetError,
+    FrameDisposition,
+    IpPacketOptions,
+    MacAddress,
+    RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+    RawEthernetConfig,
+    RawEthernetEndpoint,
+    STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES,
+    STANDARD_MTU_IPV6_UDP_PAYLOAD_BYTES,
+    STANDARD_MTU_UDP_PAYLOAD_BYTES,
+    build_udp_frame,
+    parse_udp_frame,
 };
 
 const BOARD_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 209, 0);
 const HOST_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 209, 1);
+const BOARD_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0x0db8, 0x1234, 0, 0, 0, 0, 0x7a);
+const HOST_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0x0db8, 0x1234, 0, 0, 0, 0, 1);
 const BOARD_PORT: u16 = 24_576;
 const HOST_PORT: u16 = 49_152;
 
@@ -16,6 +35,14 @@ fn raw_endpoint(mac: &str, ipv4: Ipv4Addr, port: u16) -> RawEthernetEndpoint {
     RawEthernetEndpoint::new(
         MacAddress::from_str(mac).expect("MAC"),
         Endpoint::new(ipv4, port).expect("endpoint"),
+    )
+    .expect("raw endpoint")
+}
+
+fn raw_ipv6_endpoint(mac: &str, ipv6: Ipv6Addr, port: u16) -> RawEthernetEndpoint {
+    RawEthernetEndpoint::new(
+        MacAddress::from_str(mac).expect("MAC"),
+        Endpoint::new(ipv6, port).expect("endpoint"),
     )
     .expect("raw endpoint")
 }
@@ -31,6 +58,17 @@ fn config() -> RawEthernetConfig {
     .expect("config")
 }
 
+fn ipv6_config() -> RawEthernetConfig {
+    RawEthernetConfig::new(
+        RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+        "eth0",
+        raw_ipv6_endpoint("02:00:00:00:00:01", HOST_IPV6, HOST_PORT),
+        raw_ipv6_endpoint("02:00:00:00:00:7a", BOARD_IPV6, BOARD_PORT),
+        8,
+    )
+    .expect("IPv6 config")
+}
+
 fn inbound_frame_from(
     sender: RawEthernetEndpoint,
     recipient: RawEthernetEndpoint,
@@ -44,7 +82,12 @@ fn inbound_frame_from(
         8,
     )
     .expect("reverse config");
-    build_udp_frame(&reverse, payload, 17).expect("build inbound frame")
+    build_udp_frame(
+        &reverse,
+        payload,
+        IpPacketOptions::Ipv4 { identification: 17 },
+    )
+    .expect("build inbound frame")
 }
 
 fn inbound_frame(payload: &[u8]) -> Vec<u8> {
@@ -90,17 +133,35 @@ fn config_rejects_ambiguous_or_unsupported_identity() {
     assert!(MacAddress::from_str("ff:ff:ff:ff:ff:ff").is_err());
     assert!(MacAddress::from_str("00:00:00:00:00:00").is_err());
     assert!(Endpoint::new(Ipv4Addr::UNSPECIFIED, BOARD_PORT).is_err());
+    assert!(Endpoint::new(Ipv6Addr::UNSPECIFIED, BOARD_PORT).is_err());
+    assert!(Endpoint::new(Ipv6Addr::LOCALHOST, BOARD_PORT).is_err());
     assert!(Endpoint::new(BOARD_IP, 0).is_err());
+    assert_eq!(
+        Endpoint::new(HOST_IPV6, HOST_PORT)
+            .expect("IPv6 endpoint")
+            .as_ipv6(),
+        Some(HOST_IPV6)
+    );
 
     let host = raw_endpoint("02:00:00:00:00:01", HOST_IP, HOST_PORT);
     let board = raw_endpoint("02:00:00:00:00:7a", BOARD_IP, BOARD_PORT);
     assert!(matches!(
-        RawEthernetConfig::new(2, "eth0", host, board, 8),
-        Err(EthernetError::UnsupportedSchemaVersion(2))
+        RawEthernetConfig::new(1, "eth0", host, board, 8),
+        Err(EthernetError::UnsupportedSchemaVersion(1))
     ));
-    assert!(RawEthernetConfig::new(1, "../eth0", host, board, 8).is_err());
-    assert!(RawEthernetConfig::new(1, "eth0", host, host, 8).is_err());
-    assert!(RawEthernetConfig::new(1, "eth0", host, board, 0).is_err());
+    assert!(RawEthernetConfig::new(2, "../eth0", host, board, 8).is_err());
+    assert!(RawEthernetConfig::new(2, "eth0", host, host, 8).is_err());
+    assert!(RawEthernetConfig::new(2, "eth0", host, board, 0).is_err());
+    assert!(matches!(
+        RawEthernetConfig::new(
+            2,
+            "eth0",
+            host,
+            raw_ipv6_endpoint("02:00:00:00:00:7a", BOARD_IPV6, BOARD_PORT),
+            8,
+        ),
+        Err(EthernetError::MixedIpFamilies { .. })
+    ));
 }
 
 #[test]
@@ -200,7 +261,14 @@ fn exact_udp_frame_round_trip_is_strict() {
 
 #[test]
 fn short_frames_are_padded_without_changing_protocol_lengths() {
-    let frame = build_udp_frame(&config(), &[1, 2, 3], 0x1234).expect("build frame");
+    let frame = build_udp_frame(
+        &config(),
+        &[1, 2, 3],
+        IpPacketOptions::Ipv4 {
+            identification: 0x1234,
+        },
+    )
+    .expect("build frame");
     assert_eq!(frame.len(), 60);
     assert_eq!(u16::from_be_bytes([frame[16], frame[17]]), 31);
     assert_eq!(u16::from_be_bytes([frame[38], frame[39]]), 11);
@@ -209,15 +277,33 @@ fn short_frames_are_padded_without_changing_protocol_lengths() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn standard_mtu_payload_ceiling_is_enforced() {
-    let payload = vec![0x5a; STANDARD_MTU_UDP_PAYLOAD_BYTES];
-    let frame = build_udp_frame(&config(), &payload, 1).expect("maximum payload");
+    let payload = vec![0x5a; STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES];
+    let frame = build_udp_frame(
+        &config(),
+        &payload,
+        IpPacketOptions::Ipv4 { identification: 1 },
+    )
+    .expect("maximum payload");
     assert_eq!(frame.len(), 1514);
     assert_eq!(&frame[40..42], &[0, 0]);
+    assert_eq!(
+        STANDARD_MTU_UDP_PAYLOAD_BYTES,
+        STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES
+    );
+    assert_eq!(
+        config().maximum_udp_payload_bytes(),
+        STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES
+    );
     assert!(matches!(
-        build_udp_frame(&config(), &[0; STANDARD_MTU_UDP_PAYLOAD_BYTES + 1], 1),
+        build_udp_frame(
+            &config(),
+            &[0; STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES + 1],
+            IpPacketOptions::Ipv4 { identification: 1 },
+        ),
         Err(EthernetError::PayloadTooLarge(size))
-            if size == STANDARD_MTU_UDP_PAYLOAD_BYTES + 1
+            if size == STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES + 1
     ));
 
     let mut oversized = inbound_frame(&payload);
@@ -228,8 +314,78 @@ fn standard_mtu_payload_ceiling_is_enforced() {
     assert_eq!(
         parse_udp_frame(&oversized, &config()),
         FrameDisposition::Invalid(EthernetError::PayloadTooLarge(
-            STANDARD_MTU_UDP_PAYLOAD_BYTES + 1
+            STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES + 1
         ))
+    );
+}
+
+#[test]
+fn ipv6_udp_frame_round_trip_is_strict_and_checksummed() {
+    let config = ipv6_config();
+    assert_eq!(
+        config.maximum_udp_payload_bytes(),
+        STANDARD_MTU_IPV6_UDP_PAYLOAD_BYTES
+    );
+    let reverse = RawEthernetConfig::new(
+        RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+        "eth0",
+        config.board(),
+        config.host(),
+        8,
+    )
+    .expect("reverse config");
+    let payload = b"ipv6 telemetry";
+    let frame = build_udp_frame(&reverse, payload, IpPacketOptions::Ipv6).expect("IPv6 frame");
+    assert_eq!(&frame[12..14], &[0x86, 0xdd]);
+    assert_eq!(frame[14] >> 4, 6);
+    assert_eq!(frame[20], 17);
+    assert_eq!(frame[21], 64);
+    assert_eq!(&frame[60..62], &[0xbc, 0x89]);
+    assert_eq!(
+        parse_udp_frame(&frame, &config),
+        FrameDisposition::Matched {
+            payload: payload.to_vec(),
+            sender: Endpoint::new(BOARD_IPV6, BOARD_PORT).expect("board endpoint"),
+        }
+    );
+
+    let mut missing_checksum = frame.clone();
+    missing_checksum[60..62].fill(0);
+    assert_eq!(
+        parse_udp_frame(&missing_checksum, &config),
+        FrameDisposition::Invalid(EthernetError::MissingIpv6UdpChecksum)
+    );
+
+    let mut bad_checksum = frame.clone();
+    bad_checksum[60] ^= 1;
+    assert_eq!(
+        parse_udp_frame(&bad_checksum, &config),
+        FrameDisposition::Invalid(EthernetError::InvalidIpv6UdpChecksum)
+    );
+
+    let mut extension = frame.clone();
+    extension[20] = 0;
+    assert_eq!(
+        parse_udp_frame(&extension, &config),
+        FrameDisposition::Invalid(EthernetError::UnsupportedIpv6ExtensionHeader(0))
+    );
+
+    assert!(matches!(
+        build_udp_frame(
+            &config,
+            &[0; STANDARD_MTU_IPV6_UDP_PAYLOAD_BYTES + 1],
+            IpPacketOptions::Ipv6,
+        ),
+        Err(EthernetError::PayloadTooLarge(size))
+            if size == STANDARD_MTU_IPV6_UDP_PAYLOAD_BYTES + 1
+    ));
+    assert_eq!(
+        build_udp_frame(
+            &config,
+            payload,
+            IpPacketOptions::Ipv4 { identification: 1 },
+        ),
+        Err(EthernetError::PacketOptionsFamilyMismatch)
     );
 }
 
