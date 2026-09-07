@@ -1,10 +1,11 @@
 # Release process
 
 Repository releases use ASCII SemVer tags of the form `vMAJOR.MINOR.PATCH`.
-The tag must match the package version in `Cargo.toml`. The package sets
-`publish = true`. Publishing the GitHub Release triggers the CI workflow,
-which publishes the crate to crates.io. The local runner does not edit
-`Cargo.toml` or `Cargo.lock`.
+The tag, Rust crate, and Python package use the version in `Cargo.toml`.
+Publishing the GitHub Release triggers `.github/workflows/release.yml`. The
+workflow builds all artifacts, publishes the crate to crates.io, and then
+publishes the Python distributions to PyPI. The local runner does not edit
+`Cargo.toml`, `Cargo.lock`, or `pyproject.toml`.
 
 Use the `cut-release` skill for ordinary execution. The checked-in runner is
 invoked through `just`:
@@ -49,16 +50,53 @@ The runner:
    validated `HEAD`;
 6. atomically creates `refs/tags/<version>` at the validated SHA with a direct
    tag push when the tag is absent; and
-7. as the last action, creates the GitHub Release with `--verify-tag` and the
-   reviewed notes snapshot from standard input.
+7. as the last local action, creates the GitHub Release with `--verify-tag` and
+   the reviewed notes snapshot from standard input.
 
 The final two direct remote writes for a new release are the tag push and then
-GitHub Release creation. Release creation triggers CI, which validates and
-publishes the crate. The local runner does not push a branch, create a commit,
-mutate a manifest, or invoke a workflow directly. `--dry-run` performs every
-preflight and repository check, prints both prospective write commands, and
-executes neither write. Fetching remote refs and normal build outputs are its
-only local effects.
+GitHub Release creation. Release creation triggers the package workflow. The
+local runner does not push a branch, create a commit, mutate a manifest, or
+invoke a workflow directly. `--dry-run` performs every preflight and repository
+check, prints both prospective write commands, and executes neither write.
+Fetching remote refs and normal build outputs are its only local effects.
+
+## Registry workflow
+
+Before the first release, configure these repository and registry settings:
+
+- Add a GitHub `crates-io` environment. Store a crates.io publish token in the
+  repository secret `CARGO_REGISTRY_TOKEN`. The token is available only to the
+  crate publish step.
+- Add a GitHub `pypi` environment. Configure the PyPI project
+  `ccsds-ethernet-client` to trust repository
+  `iancleary/ccsds-ethernet-client`, workflow `release.yml`, and environment
+  `pypi`. The workflow uses OIDC Trusted Publishing and stores no PyPI token.
+- Add required reviewers or tag protection to the two environments when the
+  repository policy requires manual publication approval.
+
+The workflow performs this sequence:
+
+1. Verify that the GitHub Release tag matches `Cargo.toml`. Run the Rust,
+   Python, release-runner, and workflow contract checks.
+2. Build CPython 3.11 stable-ABI wheels for Linux x86-64 and AArch64. Build a
+   source distribution. Store each output as a workflow artifact.
+3. After every build succeeds, publish the crate with `cargo publish --locked`.
+4. After crates.io publication succeeds, download the previously built Python
+   artifacts and publish them through the `pypi` environment.
+
+The PyPI job alone receives `id-token: write`. Build jobs have read-only
+repository permission and no registry credentials. Third-party actions and
+Maturin are pinned. Update the pins in a reviewed pull request.
+
+If `cargo publish` reports an ambiguous timeout or index error, inspect the
+requested version on crates.io before rerunning the publish job. Do not assume
+that a failed job means the upload failed.
+
+If crates.io publication succeeds and PyPI publication fails, do not rerun the
+whole GitHub Release event blindly. Inspect the release workflow and PyPI
+project first. The crate version is permanent. Re-run only the failed PyPI job
+after fixing the environment or Trusted Publisher configuration. The stored
+artifacts from that workflow run remain the release inputs.
 
 ## Recovery after the final commands
 

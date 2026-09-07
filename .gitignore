@@ -1,2 +1,8 @@
 /target/
 /.vscode/
+/.venv/
+/dist/
+*.egg-info/
+__pycache__/
+*.so
+*.pyd

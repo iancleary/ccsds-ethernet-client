@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Validate and create a SemVer GitHub release that triggers crate publication."""
+"""Create a SemVer GitHub release that triggers Rust and Python publication."""
 
 from __future__ import annotations
 

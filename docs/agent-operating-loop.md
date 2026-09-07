@@ -15,11 +15,17 @@ framework around it.
   packet-ring accounting, observation statistics, and portable test doubles.
 - `src/linux.rs` is the only Linux raw-socket implementation and the only
   unsafe/system-call boundary. It must stay behind `cfg(target_os = "linux")`.
+- `src/python.rs`, `pyproject.toml`, and `python/` own the thin byte-oriented
+  Python binding. They must not duplicate transport or mission policy.
 - `tests/frame_transport.rs` is the executable frame/config/ring contract.
 - `tests/session.rs` is the executable session/codec/error contract.
+- `python/tests/test_bindings.py` is the hardware-free Python boundary
+  contract.
 - `docs/release.md`, `scripts/cut_release.py`, and
-  `scripts/test_cut_release.py` own release behavior. Do not describe a release
-  step elsewhere unless it routes back to those files.
+  `scripts/test_cut_release.py` own local release behavior. The release
+  workflow and `scripts/test_release_workflow.py` own registry publication
+  order. Do not describe a release step elsewhere unless it routes back to
+  those files.
 
 ## Invariants
 
@@ -57,6 +63,11 @@ Preserve these unless the pull request explicitly changes the public contract:
   acknowledgement. Queue capacity and drops are observable through statistics.
 - `close` is idempotent and leaves the session closed even if the underlying
   transport reports a close error.
+- Python accepts caller-owned addresses and byte payloads only. It does not
+  add schemas, correlation, acknowledgement interpretation, retry, recording,
+  or safety policy. Blocking live calls detach from the Python interpreter.
+- Release artifacts are built before publication. crates.io publication must
+  succeed before PyPI Trusted Publishing starts.
 
 ## Change loop
 
@@ -67,6 +78,8 @@ Preserve these unless the pull request explicitly changes the public contract:
 3. Add or update executable evidence beside the behavior:
    `tests/frame_transport.rs` for bytes and config validation,
    `tests/session.rs` for codec/session semantics,
+   `python/tests/test_bindings.py` for the Python boundary,
+   `scripts/test_release_workflow.py` for registry publication ordering, and
    `scripts/test_cut_release.py` for release-runner behavior.
 4. Keep consuming-system responsibilities out of the crate. Prefer typed hooks
    and explicit errors over policy defaults.
