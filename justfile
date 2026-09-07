@@ -6,7 +6,7 @@ default:
 
 # Run deterministic, hardware-free tests.
 test:
-    cargo test --locked
+    cargo test --locked --all-targets
 
 # Build the extension and run hardware-free Python contract tests.
 python-test:
@@ -15,7 +15,7 @@ python-test:
 # Format, test, lint, and check patch whitespace.
 check:
     cargo fmt --check
-    cargo test --locked
+    cargo test --locked --all-targets
     cargo clippy --locked --all-targets -- -D warnings
     PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
     just python-test
