@@ -21,6 +21,10 @@ jobs:
         run: rustup update stable && rustup default stable
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: "1.51.0"
       - name: Verify release tag and packages
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
