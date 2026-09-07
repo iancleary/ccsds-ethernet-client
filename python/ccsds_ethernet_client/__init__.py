@@ -11,11 +11,13 @@ from ._native import (
     build_udp_frame,
     parse_udp_frame,
 )
+from .threaded import ThreadedRawEthernetClient
 
 __all__ = [
     "ConfigError",
     "FrameError",
     "RawEthernetClient",
+    "ThreadedRawEthernetClient",
     "RawEthernetConfig",
     "ReceivedDatagram",
     "TransportError",

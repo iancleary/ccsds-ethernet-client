@@ -4,7 +4,10 @@ from typing import final
 
 class ConfigError(ValueError): ...
 class FrameError(ValueError): ...
-class TransportError(RuntimeError): ...
+class TransportError(RuntimeError):
+    operation: str | None
+    errno: int | None
+    kind: str | None
 
 @final
 class RawEthernetConfig:
@@ -19,9 +22,12 @@ class RawEthernetConfig:
         board_udp_port: int,
         ring_capacity: int,
         schema_version: int = 2,
+        ipv4_checksum_policy: str = "legacy",
     ) -> None: ...
     @property
     def schema_version(self) -> int: ...
+    @property
+    def ipv4_checksum_policy(self) -> str: ...
     @property
     def interface_name(self) -> str: ...
     @property
@@ -52,6 +58,12 @@ class ReceivedDatagram:
 
 @final
 class TransportStatistics:
+    @property
+    def vlan_frames(self) -> int: ...
+    @property
+    def statistics_failures(self) -> int: ...
+    @property
+    def truncated_frames(self) -> int: ...
     @property
     def receive_ready(self) -> bool: ...
     @property

@@ -451,6 +451,74 @@ fn valid_nonzero_udp_checksum_is_accepted() {
 }
 
 #[test]
+fn checksum_policy_is_explicit_and_detects_payload_corruption() {
+    use ccsds_ethernet_client::Ipv4ChecksumPolicy;
+    let config = config();
+    let reverse = RawEthernetConfig::new(2, "eth0", config.board(), config.host(), 8)
+        .unwrap()
+        .with_ipv4_checksum_policy(Ipv4ChecksumPolicy::Generate);
+    let required = config
+        .clone()
+        .with_ipv4_checksum_policy(Ipv4ChecksumPolicy::Require);
+    for size in [0, 1, 2, 9, 1472] {
+        let payload = vec![0x51; size];
+        let mut frame = build_udp_frame(
+            &reverse,
+            &payload,
+            IpPacketOptions::Ipv4 { identification: 0 },
+        )
+        .unwrap();
+        assert_ne!(&frame[40..42], &[0, 0]);
+        assert!(matches!(
+            parse_udp_frame(&frame, &required),
+            FrameDisposition::Matched { .. }
+        ));
+        if size > 0 {
+            frame[42] ^= 1;
+            assert_eq!(
+                parse_udp_frame(&frame, &required),
+                FrameDisposition::Invalid(EthernetError::InvalidUdpChecksum)
+            );
+        }
+    }
+    let frame = inbound_frame(b"legacy");
+    assert!(matches!(
+        parse_udp_frame(&frame, &config),
+        FrameDisposition::Matched { .. }
+    ));
+    assert_eq!(
+        parse_udp_frame(&frame, &required),
+        FrameDisposition::Invalid(EthernetError::MissingIpv4UdpChecksum)
+    );
+}
+
+#[test]
+fn arbitrary_input_and_truncation_never_panic() {
+    let configs = [config(), ipv6_config()];
+    let mut state = 0x12345678_u32;
+    for config in &configs {
+        for length in 0..2049 {
+            let bytes: Vec<_> = (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect();
+            let _ = parse_udp_frame(&bytes, config);
+        }
+    }
+    let valid = inbound_frame(&[0x55; 100]);
+    for length in 0..valid.len() {
+        assert!(!matches!(
+            parse_udp_frame(&valid[..length], &config()),
+            FrameDisposition::Matched { .. }
+        ));
+    }
+}
+
+#[test]
 fn bounded_packet_ring_reports_overflow_and_maximum_depth() {
     let mut ring = BoundedPacketRing::new(2).expect("ring");
     assert!(ring.push(10));

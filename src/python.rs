@@ -16,6 +16,7 @@ use crate::{
     FrameClassificationStatistics,
     FrameDisposition,
     IpPacketOptions,
+    Ipv4ChecksumPolicy,
     MacAddress,
     RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
     RawEthernetConfig,
@@ -41,10 +42,28 @@ fn frame_error(error: impl ToString) -> PyErr {
 
 #[cfg(target_os = "linux")]
 fn transport_error(error: RustTransportError) -> PyErr {
-    match error {
+    let result = match &error {
         RustTransportError::TimedOut => PyTimeoutError::new_err(error.to_string()),
         _ => TransportError::new_err(error.to_string()),
-    }
+    };
+    Python::attach(|py| {
+        let value = result.value(py);
+        let (operation, errno, kind) = match &error {
+            RustTransportError::Io {
+                operation,
+                raw_os_error,
+                kind,
+                ..
+            } => (Some(*operation), *raw_os_error, Some(format!("{kind:?}"))),
+            _ => (None, None, None),
+        };
+        // Built-in exception instances support attributes; keep the original
+        // transport failure if attribute allocation itself fails.
+        let _ = value.setattr("operation", operation);
+        let _ = value.setattr("errno", errno);
+        let _ = value.setattr("kind", kind);
+    });
+    result
 }
 
 fn endpoint(mac: &str, ip: &str, udp_port: u16) -> PyResult<RawEthernetEndpoint> {
@@ -73,6 +92,7 @@ impl PyRawEthernetConfig {
         board_udp_port,
         ring_capacity,
         schema_version=RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
+        ipv4_checksum_policy="legacy",
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -85,18 +105,40 @@ impl PyRawEthernetConfig {
         board_udp_port: u16,
         ring_capacity: usize,
         schema_version: u16,
+        ipv4_checksum_policy: &str,
     ) -> PyResult<Self> {
         let host = endpoint(host_mac, host_ip, host_udp_port)?;
         let board = endpoint(board_mac, board_ip, board_udp_port)?;
         let inner =
             RawEthernetConfig::new(schema_version, interface_name, host, board, ring_capacity)
                 .map_err(config_error)?;
-        Ok(Self { inner })
+        let policy = match ipv4_checksum_policy {
+            "legacy" => Ipv4ChecksumPolicy::Legacy,
+            "generate" => Ipv4ChecksumPolicy::Generate,
+            "require" => Ipv4ChecksumPolicy::Require,
+            _ => {
+                return Err(ConfigError::new_err(
+                    "ipv4_checksum_policy must be legacy, generate, or require",
+                ));
+            }
+        };
+        Ok(Self {
+            inner: inner.with_ipv4_checksum_policy(policy),
+        })
     }
 
     #[getter]
     fn schema_version(&self) -> u16 {
         self.inner.schema_version()
+    }
+
+    #[getter]
+    fn ipv4_checksum_policy(&self) -> &'static str {
+        match self.inner.ipv4_checksum_policy() {
+            Ipv4ChecksumPolicy::Legacy => "legacy",
+            Ipv4ChecksumPolicy::Generate => "generate",
+            Ipv4ChecksumPolicy::Require => "require",
+        }
     }
 
     #[getter]
@@ -194,6 +236,18 @@ struct PyTransportStatistics {
 
 #[pymethods]
 impl PyTransportStatistics {
+    #[getter]
+    fn vlan_frames(&self) -> u64 {
+        self.inner.vlan_frames
+    }
+    #[getter]
+    fn statistics_failures(&self) -> u64 {
+        self.inner.statistics_failures
+    }
+    #[getter]
+    fn truncated_frames(&self) -> u64 {
+        self.inner.truncated_frames
+    }
     #[getter]
     fn receive_ready(&self) -> bool {
         self.inner.receive_ready

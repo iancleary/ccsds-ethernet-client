@@ -7,6 +7,12 @@ default:
 # Run deterministic, hardware-free tests.
 test:
     cargo test --locked --all-targets
+    cargo test --locked --doc
+
+# Requires Linux, iproute2, and permission to create disposable network namespaces.
+[positional-arguments]
+linux-test *args:
+    python3 scripts/test_linux_live.py "$@"
 
 # Build the extension and run hardware-free Python contract tests.
 python-test:
@@ -16,6 +22,7 @@ python-test:
 check:
     cargo fmt --check
     cargo test --locked --all-targets
+    cargo test --locked --doc
     cargo clippy --locked --all-targets -- -D warnings
     PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
     just python-test

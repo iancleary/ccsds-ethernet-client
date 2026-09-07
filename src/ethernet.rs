@@ -105,11 +105,24 @@ impl RawEthernetEndpoint {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawEthernetConfig {
+    ipv4_checksum_policy: Ipv4ChecksumPolicy,
     schema_version: u16,
     interface_name: String,
     host: RawEthernetEndpoint,
     board: RawEthernetEndpoint,
     ring_capacity: usize,
+}
+
+/// IPv4 UDP checksum interoperability policy. IPv6 always requires checksums.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Ipv4ChecksumPolicy {
+    /// Preserve the original wire behavior: transmit zero, accept zero.
+    #[default]
+    Legacy,
+    /// Generate checksums, but accept legacy zero-checksum peers.
+    Generate,
+    /// Generate checksums and reject zero-checksum packets.
+    Require,
 }
 
 impl RawEthernetConfig {
@@ -121,6 +134,7 @@ impl RawEthernetConfig {
         ring_capacity: usize,
     ) -> Result<Self, EthernetError> {
         let config = Self {
+            ipv4_checksum_policy: Ipv4ChecksumPolicy::Legacy,
             schema_version,
             interface_name: interface_name.into(),
             host,
@@ -170,6 +184,15 @@ impl RawEthernetConfig {
 
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
+    }
+
+    pub fn with_ipv4_checksum_policy(mut self, policy: Ipv4ChecksumPolicy) -> Self {
+        self.ipv4_checksum_policy = policy;
+        self
+    }
+
+    pub const fn ipv4_checksum_policy(&self) -> Ipv4ChecksumPolicy {
+        self.ipv4_checksum_policy
     }
 
     pub fn interface_name(&self) -> &str {
@@ -222,6 +245,7 @@ pub enum EthernetError {
     InvalidIpv6UdpChecksum,
     InvalidUdpLength,
     InvalidUdpChecksum,
+    MissingIpv4UdpChecksum,
     MixedIpFamilies { host: IpAddr, board: IpAddr },
     PacketOptionsFamilyMismatch,
 }
@@ -258,6 +282,9 @@ impl fmt::Display for EthernetError {
             Self::InvalidIpv6UdpChecksum => formatter.write_str("invalid IPv6 UDP checksum"),
             Self::InvalidUdpLength => formatter.write_str("invalid UDP length"),
             Self::InvalidUdpChecksum => formatter.write_str("invalid UDP checksum"),
+            Self::MissingIpv4UdpChecksum => {
+                formatter.write_str("missing required IPv4 UDP checksum")
+            }
             Self::MixedIpFamilies { host, board } => write!(
                 formatter,
                 "host and board IP addresses must use the same family, got {host} and {board}"
@@ -363,8 +390,19 @@ fn build_ipv4_udp_frame(
     frame[udp..udp + 2].copy_from_slice(&config.host.network.udp_port().to_be_bytes());
     frame[udp + 2..udp + 4].copy_from_slice(&config.board.network.udp_port().to_be_bytes());
     frame[udp + 4..udp + 6].copy_from_slice(&udp_length.to_be_bytes());
-    // IPv4 permits a zero UDP checksum; preserve that source transport behavior.
+    // IPv4 permits a zero UDP checksum; retain it only in legacy transmit mode.
     frame[udp + UDP_HEADER_BYTES..udp + usize::from(udp_length)].copy_from_slice(payload);
+    if config.ipv4_checksum_policy != Ipv4ChecksumPolicy::Legacy {
+        let mut pseudo = Vec::with_capacity(12 + usize::from(udp_length));
+        pseudo.extend_from_slice(&host.octets());
+        pseudo.extend_from_slice(&board.octets());
+        pseudo.extend_from_slice(&[0, IP_PROTOCOL_UDP]);
+        pseudo.extend_from_slice(&udp_length.to_be_bytes());
+        pseudo.extend_from_slice(&frame[udp..udp + usize::from(udp_length)]);
+        let checksum = internet_checksum(&pseudo);
+        frame[udp + 6..udp + 8]
+            .copy_from_slice(&if checksum == 0 { 0xffff } else { checksum }.to_be_bytes());
+    }
     Ok(frame)
 }
 
@@ -492,6 +530,9 @@ fn parse_ipv4_udp_frame(frame: &[u8], config: &RawEthernetConfig) -> FrameDispos
     }
 
     let udp_checksum = u16::from_be_bytes([frame[udp + 6], frame[udp + 7]]);
+    if udp_checksum == 0 && config.ipv4_checksum_policy == Ipv4ChecksumPolicy::Require {
+        return FrameDisposition::Invalid(EthernetError::MissingIpv4UdpChecksum);
+    }
     if udp_checksum != 0
         && !udp_checksum_valid(
             &frame[ip + 12..ip + 16],

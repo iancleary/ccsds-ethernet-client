@@ -79,7 +79,8 @@ The workflow performs this sequence:
 1. Verify that the GitHub Release tag matches `Cargo.toml`. Run the Rust,
    Python, release-runner, and workflow contract checks.
 2. Build CPython 3.11 stable-ABI wheels for Linux x86-64 and AArch64. Build a
-   source distribution. Store each output as a workflow artifact.
+   source distribution. Install each wheel on its native architecture and run
+   Python contract and isolated packet-socket tests before artifact upload.
 3. After every build succeeds, publish the crate with `cargo publish --locked`.
 4. After crates.io publication succeeds, download the previously built Python
    artifacts and publish them through the `pypi` environment.

@@ -24,6 +24,7 @@ pub use ethernet::{
     EthernetError,
     FrameDisposition,
     IpPacketOptions,
+    Ipv4ChecksumPolicy,
     MacAddress,
     RAW_ETHERNET_CONFIG_SCHEMA_VERSION,
     RawEthernetConfig,
@@ -51,6 +52,7 @@ pub use session::{
     ExchangeError,
     ReceiveError,
     Session,
+    SessionDiagnostics,
     SessionStatistics,
 };
 #[rustfmt::skip]

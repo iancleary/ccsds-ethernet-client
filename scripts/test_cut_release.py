@@ -17,7 +17,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cut_release  # noqa: E402
 
-VERSION = "v0.2.2"
+# Exercise the current release version without maintaining a second version source.
+VERSION = cut_release.package_version()
 SHA = "a" * 40
 CANONICAL_ORIGIN = "git@github.com:iancleary/ccsds-ethernet-client.git"
 
@@ -85,10 +86,13 @@ class FakeRun:
 
 class VersionTests(unittest.TestCase):
     def test_package_version_comes_from_cargo_manifest(self) -> None:
-        self.assertEqual(cut_release.package_version(), VERSION)
+        manifest = mock.mock_open(read_data=b'[package]\nversion = "12.34.56"\n')
+        with mock.patch.object(Path, "open", manifest):
+            self.assertEqual(cut_release.package_version(), "v12.34.56")
+        manifest.assert_called_once_with("rb")
 
     def test_parse_version_is_ascii_semver(self) -> None:
-        self.assertEqual(cut_release.parse_version(VERSION), (0, 2, 2))
+        self.assertEqual(cut_release.parse_version("v12.34.56"), (12, 34, 56))
         invalid = (
             "0.1.0",
             "v0.1",
