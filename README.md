@@ -34,6 +34,63 @@ selecting an interface are deployment responsibilities. Frame/config/ring/
 session tests use `MemoryTransport`; default checks never open a NIC or require
 root.
 
+## Rust example
+
+Run the hardware-free example to send one typed command through `Session`,
+receive a correlated acknowledgement, and read telemetry that reports an
+incremented command counter:
+
+```sh
+cargo run --example dummy_ccsds
+```
+
+```text
+command packet:   11 20 c0 29 00 02 01 00 29
+telemetry packet: 01 21 c0 00 00 02 02 00 2a
+ack packet:       01 22 c0 00 00 02 03 00 29
+acknowledged command counter: 41
+telemetry command counter:    42
+```
+
+These are complete Space Packets that follow
+[CCSDS 133.0-B-2](https://ccsds.org/Pubs/133x0b2e2.pdf), with the mandatory
+six-octet primary header. The example uses version `0`, no secondary header,
+and unsegmented packets. APID `0x120` carries the dummy telecommand. APID
+`0x121` carries the dummy telemetry, and APID `0x122` carries the dummy
+acknowledgement. The packet data length is `0x0002`, which means three data
+octets because CCSDS encodes this field as the number of data octets minus one.
+
+The application data is intentionally small and mission-specific:
+
+```text
+command data:   01 00 29  # increment command, counter 41
+telemetry data: 02 00 2a  # counter report, counter 42
+```
+
+The application-level command counter is not the primary-header packet
+sequence count. The command uses sequence count 41 for illustration. The
+telemetry APID has its own sequence count, starting at zero.
+
+The example implements `Codec` in the consuming program and uses
+`MemoryTransport` to supply dummy board packets:
+
+```rust
+let transport = MemoryTransport::with_incoming([
+    incoming_frame(telemetry_packet, board),
+    incoming_frame(acknowledgement_packet, board),
+]);
+let mut session = Session::from_transport(DummyCodec, transport, board)?;
+
+let deadline = Instant::now() + Duration::from_secs(1);
+let acknowledgement = session.exchange_once(&command, deadline)?;
+let telemetry = session.next_telemetry(deadline)?;
+```
+
+See [`examples/dummy_ccsds.rs`](examples/dummy_ccsds.rs) for the complete
+packet encoder, decoder, typed codec, exchange, and exact-byte tests. The APIDs
+and application data are examples only; a consuming mission crate owns those
+definitions.
+
 ## Python package
 
 Install `ccsds-ethernet-client` from PyPI on Python 3.11 or newer. Published
