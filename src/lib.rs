@@ -8,6 +8,8 @@ mod endpoint;
 pub mod ethernet;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(feature = "python")]
+mod python;
 mod session;
 pub mod transport;
 

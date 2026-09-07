@@ -5,8 +5,6 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
-  release:
-    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,23 +16,33 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Use Rust stable
         run: rustup update stable && rustup default stable
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --locked
+      - name: Check Python bindings
+        run: |
+          PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
+          uv run --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc '
+            maturin develop --locked
+            python -m unittest discover -s python/tests -v
+          '
+      - name: Run release contract tests
+        run: |
+          uv run scripts/test_cut_release.py
+          uv run scripts/test_release_workflow.py
       - name: Check documentation
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+        run: PYO3_NO_PYTHON=1 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
       - name: Verify package
-        run: cargo package
+        run: cargo package --locked
       - name: Build project
         run: cargo build --release
-      - name: Publish (on tag)
-        if: github.ref_type == 'tag'
-        run: cargo publish --verbose
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

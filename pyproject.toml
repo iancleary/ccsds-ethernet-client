@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.11,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ccsds-ethernet-client"
+dynamic = ["version"]
+description = "Python bindings for the typed CCSDS raw-Ethernet client"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Ian Cleary", email = "iancleary@hey.com" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: System :: Networking",
+]
+
+[project.urls]
+Repository = "https://github.com/iancleary/ccsds-ethernet-client"
+Issues = "https://github.com/iancleary/ccsds-ethernet-client/issues"
+
+[tool.maturin]
+features = ["python"]
+module-name = "ccsds_ethernet_client._native"
+python-source = "python"

@@ -1,9 +1,11 @@
 # CCSDS Ethernet client
 
-This crate provides typed, in-process command exchange with a directly
-attached CCSDS Ethernet endpoint. It has no daemon, service, RPC API, sender
-CLI, Python layer, plugin system, recording layer, automatic retry, or UDP/raw
-fallback.
+This project provides typed, in-process command exchange with a directly
+attached CCSDS Ethernet endpoint. The Rust crate owns the full typed session
+contract. The optional Python package exposes strict configuration, byte-level
+frame helpers, and the Linux raw transport for test orchestrators. It has no
+daemon, service, RPC API, sender CLI, plugin system, recording layer,
+automatic retry, or UDP/raw fallback.
 
 It is available under the [MIT License](LICENSE).
 
@@ -32,6 +34,40 @@ selecting an interface are deployment responsibilities. Frame/config/ring/
 session tests use `MemoryTransport`; default checks never open a NIC or require
 root.
 
+## Python package
+
+Install `ccsds-ethernet-client` from PyPI on Python 3.11 or newer. Published
+wheels target Linux x86-64 and AArch64. The source distribution supports other
+Linux targets with a Rust toolchain. Frame helpers also build on other
+platforms, but `RawEthernetClient` rejects live use outside Linux.
+
+```python
+from ccsds_ethernet_client import RawEthernetClient, RawEthernetConfig
+
+config = RawEthernetConfig(
+    interface_name="eth0",
+    host_mac="02:00:00:00:00:01",
+    host_ip="169.254.209.1",
+    host_udp_port=49152,
+    board_mac="02:00:00:00:00:7a",
+    board_ip="169.254.209.0",
+    board_udp_port=24576,
+    ring_capacity=64,
+)
+
+with RawEthernetClient(config) as client:
+    client.send(b"\x10\x01")
+    datagram = client.receive(timeout_seconds=0.5)
+    print(datagram.payload, datagram.sender_ip)
+```
+
+`receive` raises `TimeoutError` when its relative monotonic timeout expires.
+Configuration failures raise `ConfigError`. Frame construction and parsing
+failures raise `FrameError`. Both are `ValueError` subclasses. Other live
+transport failures raise `TransportError`. The package does not encode
+commands, correlate acknowledgements, retry, or interpret telemetry. The test
+orchestrator owns those policies.
+
 `TransportStatistics` reports transport observations only. Detailed frame
 classification counters describe what the receive path observed; they do not
 decide whether a consumer should accept, reject, persist, or invalidate an
@@ -49,6 +85,9 @@ recording schemas, mission interpretation, and safety policy.
 ```sh
 just check
 ```
+
+Use `just python-test` to run only the extension build and hardware-free Python
+contract tests.
 
 ## Maintenance
 
