@@ -13,6 +13,38 @@ permissions:
   contents: read
 
 jobs:
+  parser-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install bounded fuzz toolchain
+        run: |
+          rustup toolchain install nightly-2026-09-07 --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz arbitrary and structured frames
+        run: cargo +nightly-2026-09-07 fuzz run frames -- -max_len=2048 -max_total_time=30
+      - name: Retain failure reproductions
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: parser-fuzz-failures
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify declared minimum Rust version
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 check --locked --all-targets
+          PYO3_NO_PYTHON=1 cargo +1.85.0 check --locked --features python --all-targets
+
   ci:
     runs-on: ubuntu-latest
     steps:
@@ -32,7 +64,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run tests
-        run: cargo test --locked
+        run: |
+          cargo test --locked --all-targets
+          cargo test --locked --doc
+      - name: Test Linux packet sockets in isolation
+        run: just linux-test
       - name: Check Python bindings
         run: |
           PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings

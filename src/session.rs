@@ -18,6 +18,8 @@ pub trait Codec {
     type Command;
     type Acknowledgement;
     type Telemetry;
+    /// Consumer-owned request identity. Equality is not proof of freshness:
+    /// do not reuse an identity while a stale acknowledgement can arrive.
     type Correlation: Eq;
     type Error: Error + Send + Sync + 'static;
 
@@ -57,13 +59,27 @@ pub enum DecodedMessage<A, T, C> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionStatistics {
+    diagnostics: SessionDiagnostics,
     transport: TransportStatistics,
     queued_telemetry: usize,
     telemetry_queue_capacity: usize,
     dropped_telemetry: u64,
 }
 
+/// Lifetime observations, including events seen during failed exchanges.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionDiagnostics {
+    pub decode_failures: u64,
+    pub unmatched_acknowledgements: u64,
+    pub ignored_messages: u64,
+    pub foreign_senders: u64,
+}
+
 impl SessionStatistics {
+    pub const fn diagnostics(self) -> SessionDiagnostics {
+        self.diagnostics
+    }
     pub const fn transport(self) -> TransportStatistics {
         self.transport
     }
@@ -149,6 +165,7 @@ impl Error for ReceiveError {
 }
 
 pub struct Session<C: Codec, T: Transport> {
+    diagnostics: SessionDiagnostics,
     codec: C,
     transport: T,
     remote: Endpoint,
@@ -166,11 +183,18 @@ impl<C: Codec, T: Transport> Session<C, T> {
     ) -> Result<Self, TransportError> {
         transport.start_receive()?;
         let telemetry_capacity = transport.statistics().queue_capacity.max(1);
+        let mut telemetry = VecDeque::new();
+        telemetry
+            .try_reserve_exact(telemetry_capacity)
+            .map_err(|error| {
+                TransportError::Other(format!("cannot allocate telemetry queue: {error}"))
+            })?;
         Ok(Self {
+            diagnostics: SessionDiagnostics::default(),
             codec,
             transport,
             remote,
-            telemetry: VecDeque::with_capacity(telemetry_capacity),
+            telemetry,
             telemetry_capacity,
             dropped_telemetry: 0,
             closed: false,
@@ -205,6 +229,8 @@ impl<C: Codec, T: Transport> Session<C, T> {
                 .receive(deadline)
                 .map_err(|source| ExchangeError::DeliveryOutcomeUnknown { source })?;
             if frame.sender != self.remote {
+                self.diagnostics.foreign_senders =
+                    self.diagnostics.foreign_senders.saturating_add(1);
                 continue;
             }
             match self.codec.decode(&frame.payload, frame.sender) {
@@ -213,7 +239,9 @@ impl<C: Codec, T: Transport> Session<C, T> {
                     correlation,
                 }) if correlation == encoded.correlation => return Ok(acknowledgement),
                 Ok(DecodedMessage::Telemetry(telemetry)) => self.queue_telemetry(telemetry),
-                Ok(DecodedMessage::Acknowledgement { .. } | DecodedMessage::Ignored) | Err(_) => {}
+                Ok(DecodedMessage::Acknowledgement { .. }) => self.record_unmatched(),
+                Ok(DecodedMessage::Ignored) => self.record_ignored(),
+                Err(_) => self.record_decode_failure(),
             }
         }
     }
@@ -232,16 +260,22 @@ impl<C: Codec, T: Transport> Session<C, T> {
                 Err(error) => return Err(ReceiveError::Transport(error)),
             };
             if sender != self.remote {
+                self.diagnostics.foreign_senders =
+                    self.diagnostics.foreign_senders.saturating_add(1);
                 continue;
             }
-            if let Ok(DecodedMessage::Telemetry(telemetry)) = self.codec.decode(&payload, sender) {
-                return Ok(telemetry);
+            match self.codec.decode(&payload, sender) {
+                Ok(DecodedMessage::Telemetry(telemetry)) => return Ok(telemetry),
+                Ok(DecodedMessage::Acknowledgement { .. }) => self.record_unmatched(),
+                Ok(DecodedMessage::Ignored) => self.record_ignored(),
+                Err(_) => self.record_decode_failure(),
             }
         }
     }
 
     pub fn statistics(&self) -> SessionStatistics {
         SessionStatistics {
+            diagnostics: self.diagnostics,
             transport: self.transport.statistics(),
             queued_telemetry: self.telemetry.len(),
             telemetry_queue_capacity: self.telemetry_capacity,
@@ -271,6 +305,19 @@ impl<C: Codec, T: Transport> Session<C, T> {
         } else {
             self.telemetry.push_back(telemetry);
         }
+    }
+
+    fn record_unmatched(&mut self) {
+        self.diagnostics.unmatched_acknowledgements = self
+            .diagnostics
+            .unmatched_acknowledgements
+            .saturating_add(1);
+    }
+    fn record_ignored(&mut self) {
+        self.diagnostics.ignored_messages = self.diagnostics.ignored_messages.saturating_add(1);
+    }
+    fn record_decode_failure(&mut self) {
+        self.diagnostics.decode_failures = self.diagnostics.decode_failures.saturating_add(1);
     }
 }
 

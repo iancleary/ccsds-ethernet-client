@@ -40,6 +40,10 @@ pub struct FrameClassificationStatistics {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransportStatistics {
+    /// Failed diagnostic reads. These never invalidate received packets.
+    pub statistics_failures: u64,
+    pub truncated_frames: u64,
+    pub vlan_frames: u64,
     pub receive_ready: bool,
     pub sent_frames: u64,
     pub received_frames: u64,
@@ -61,6 +65,13 @@ pub enum TransportError {
     NotReady,
     TimedOut,
     Closed,
+    /// An OS failure with stable operation and errno evidence.
+    Io {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+        message: String,
+    },
     Other(String),
 }
 
@@ -70,12 +81,26 @@ impl fmt::Display for TransportError {
             Self::NotReady => formatter.write_str("receive path is not ready"),
             Self::TimedOut => formatter.write_str("receive deadline expired"),
             Self::Closed => formatter.write_str("transport is closed"),
+            Self::Io {
+                operation, message, ..
+            } => write!(formatter, "{operation}: {message}"),
             Self::Other(message) => formatter.write_str(message),
         }
     }
 }
 
 impl Error for TransportError {}
+
+impl TransportError {
+    pub fn from_io(operation: &'static str, error: std::io::Error) -> Self {
+        Self::Io {
+            operation,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+}
 
 pub trait Transport {
     fn start_receive(&mut self) -> Result<(), TransportError>;
@@ -100,8 +125,12 @@ impl<T> BoundedPacketRing<T> {
                 "packet ring capacity must be at least 1".to_owned(),
             ));
         }
+        let mut frames = VecDeque::new();
+        frames.try_reserve_exact(capacity).map_err(|error| {
+            TransportError::Other(format!("cannot allocate packet ring: {error}"))
+        })?;
         Ok(Self {
-            frames: VecDeque::with_capacity(capacity),
+            frames,
             capacity,
             dropped: 0,
             maximum_depth: 0,

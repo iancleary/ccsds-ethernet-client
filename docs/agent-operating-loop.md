@@ -21,6 +21,12 @@ framework around it.
 - `tests/session.rs` is the executable session/codec/error contract.
 - `python/tests/test_bindings.py` is the hardware-free Python boundary
   contract.
+- `python/tests/test_threaded.py` tests the single-owner concurrency contract.
+  `tests/linux_live.rs` and `scripts/linux_python_smoke.py` test packet sockets
+  through the disposable fixture in `scripts/test_linux_live.py`.
+- `fuzz/` holds the arbitrary and structured frame-parser fuzz target.
+  `docs/recovery-contract.md` defines correlation and explicit recovery rules.
+  `docs/performance.md` records measurement limits and optimization gates.
 - `docs/release.md`, `scripts/cut_release.py`, and
   `scripts/test_cut_release.py` own local release behavior. The release
   workflow and `scripts/test_release_workflow.py` own registry publication

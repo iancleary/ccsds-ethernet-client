@@ -137,6 +137,14 @@ recognized, the matching detailed failure counter.
 Ignored frame payload bytes are not retained. Consumers own serialization,
 recording schemas, mission interpretation, and safety policy.
 
+For concurrent Python orchestration, `ThreadedRawEthernetClient(config)` owns the
+native client on a single thread. It provides `send`, `receive`, `statistics`,
+`cancel_receive`, and `close`. Use a context manager to join the owner thread.
+Receive and send queues are bounded; `dropped_datagrams` reports receive overflow.
+It does not interpret packets or retry sends. The original `RawEthernetClient`
+requires serialized access. See [recovery contracts](docs/recovery-contract.md)
+for request identity, checksum policy, diagnostics, and recovery semantics.
+
 ## Checks
 
 ```sh
@@ -145,6 +153,10 @@ just check
 
 Use `just python-test` to run only the extension build and hardware-free Python
 contract tests.
+
+Use `just linux-test` for isolated Linux packet-socket tests. See
+[performance evidence](docs/performance.md) for the virtual-link baseline and
+the measurements required before throughput optimizations.
 
 ## Maintenance
 

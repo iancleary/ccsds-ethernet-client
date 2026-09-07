@@ -246,7 +246,9 @@ fn record_parse_error(counters: &mut FrameClassificationStatistics, error: &Ethe
         EthernetError::MissingIpv6UdpChecksum => &mut counters.missing_ipv6_udp_checksum_failures,
         EthernetError::InvalidIpv6UdpChecksum => &mut counters.invalid_ipv6_udp_checksum_failures,
         EthernetError::InvalidUdpLength => &mut counters.invalid_udp_length_failures,
-        EthernetError::InvalidUdpChecksum => &mut counters.invalid_udp_checksum_failures,
+        EthernetError::MissingIpv4UdpChecksum | EthernetError::InvalidUdpChecksum => {
+            &mut counters.invalid_udp_checksum_failures
+        }
         _ => return,
     };
     saturating_increment(counter);
@@ -347,6 +349,21 @@ impl LinuxRawEthernetTransport {
             return Err(last_os_error("binding AF_PACKET socket"));
         }
 
+        let enabled: libc::c_int = 1;
+        // SAFETY: option storage is a live initialized integer of the stated size.
+        if unsafe {
+            libc::setsockopt(
+                socket.0,
+                libc::SOL_PACKET,
+                libc::PACKET_AUXDATA,
+                (&raw const enabled).cast(),
+                mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(last_os_error("enabling PACKET_AUXDATA"));
+        }
+
         let receive_buffer_bytes = socket_receive_buffer(socket.0)?;
         let ring_capacity = config.ring_capacity();
         Ok(Self {
@@ -372,19 +389,32 @@ impl LinuxRawEthernetTransport {
     fn drain_socket(&mut self, deadline: Instant) -> Result<DrainPassOutcome, TransportError> {
         let mut buffer = [0_u8; MAXIMUM_FRAME_BYTES];
         let outcome = drain_pass(deadline, Instant::now, || {
+            // Leave packets in the kernel until the consumer frees storage.
+            if self.ring.len() == self.ring.capacity() {
+                return Ok(false);
+            }
             let mut address: libc::sockaddr_ll = unsafe { mem::zeroed() };
-            let mut address_length = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            // usize alignment is sufficient for cmsghdr on supported Linux targets.
+            let mut control = [0_usize; 16];
+            let mut iovec = libc::iovec {
+                iov_base: buffer.as_mut_ptr().cast(),
+                iov_len: buffer.len(),
+            };
+            let mut message: libc::msghdr = unsafe { mem::zeroed() };
+            message.msg_name = (&raw mut address).cast();
+            message.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            message.msg_iov = &raw mut iovec;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = mem::size_of_val(&control);
             // SAFETY: `buffer` and `address` are writable for their full
             // reported lengths, and the socket is a live nonblocking
             // descriptor owned by this transport.
             let received = unsafe {
-                libc::recvfrom(
+                libc::recvmsg(
                     self.socket.0,
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    libc::MSG_DONTWAIT,
-                    (&raw mut address).cast::<libc::sockaddr>(),
-                    &mut address_length,
+                    &raw mut message,
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
                 )
             };
             if received < 0 {
@@ -392,13 +422,53 @@ impl LinuxRawEthernetTransport {
                 if error.kind() == io::ErrorKind::WouldBlock {
                     return Ok(false);
                 }
-                return Err(other(format!("AF_PACKET receive failed: {error}")));
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Ok(true);
+                }
+                return Err(TransportError::from_io("receive", error));
             }
             if received == 0 {
                 return Ok(false);
             }
-            let packet_type = received_packet_type(&address, address_length, self.interface_index)?;
+            if received as usize > buffer.len()
+                || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+            {
+                saturating_increment(&mut self.statistics.truncated_frames);
+                return Ok(true);
+            }
+            let packet_type =
+                received_packet_type(&address, message.msg_namelen, self.interface_index)?;
             record_packet_type(&mut self.statistics, packet_type);
+            let mut tagged = false;
+            // SAFETY: recvmsg populated this live, aligned control buffer. Check
+            // the ancillary length before reading its payload, which may be unaligned.
+            unsafe {
+                let mut header = libc::CMSG_FIRSTHDR(&message);
+                while !header.is_null() {
+                    if (*header).cmsg_level == libc::SOL_PACKET
+                        && (*header).cmsg_type == libc::PACKET_AUXDATA
+                        && (*header).cmsg_len
+                            >= libc::CMSG_LEN(mem::size_of::<libc::tpacket_auxdata>() as u32)
+                                as usize
+                    {
+                        let aux = ptr::read_unaligned(
+                            libc::CMSG_DATA(header).cast::<libc::tpacket_auxdata>(),
+                        );
+                        tagged |= aux.tp_status & libc::TP_STATUS_VLAN_VALID != 0;
+                    }
+                    header = libc::CMSG_NXTHDR(&message, header);
+                }
+            }
+            if tagged
+                || (received >= 14
+                    && matches!(
+                        u16::from_be_bytes([buffer[12], buffer[13]]),
+                        0x8100 | 0x88a8
+                    ))
+            {
+                saturating_increment(&mut self.statistics.vlan_frames);
+                return Ok(true);
+            }
             match classify_received_frame(&buffer[..received as usize], packet_type, &self.config) {
                 LinuxFrameDisposition::IgnoredOutgoing => {
                     saturating_increment(&mut self.statistics.ignored_outgoing_frames);
@@ -414,7 +484,9 @@ impl LinuxRawEthernetTransport {
         })?;
         self.statistics.dropped_frames = self.ring.dropped();
         self.statistics.maximum_queue_depth = self.ring.maximum_depth();
-        self.refresh_kernel_statistics()?;
+        if self.refresh_kernel_statistics().is_err() {
+            saturating_increment(&mut self.statistics.statistics_failures);
+        }
         Ok(outcome)
     }
 
@@ -458,7 +530,7 @@ impl LinuxRawEthernetTransport {
         let close_result = self
             .socket
             .close_with(close_socket)
-            .map_err(|error| other(format!("closing AF_PACKET socket failed: {error}")));
+            .map_err(|error| TransportError::from_io("closing AF_PACKET socket", error));
         self.closed = true;
         self.receive_ready = false;
         self.statistics.receive_ready = false;
@@ -494,8 +566,16 @@ impl Transport for LinuxRawEthernetTransport {
         if self.closed {
             return Err(TransportError::Closed);
         }
+        // A failed revalidation must not leave a previously ready socket usable.
+        self.receive_ready = false;
+        self.statistics.receive_ready = false;
         let current = inspect_interface(self.config.interface_name())?;
         current.validate_for(&self.config)?;
+        if current.index != self.interface_index {
+            return Err(other(
+                "interface index changed since socket binding".to_owned(),
+            ));
+        }
         self.receive_ready = true;
         self.statistics.receive_ready = true;
         Ok(())
@@ -547,9 +627,13 @@ impl Transport for LinuxRawEthernetTransport {
             return Err(TransportError::NotReady);
         }
         loop {
-            // Drain on every consumer call, even while the user ring still
-            // contains frames, so newly freed ring capacity is used before
-            // the kernel socket buffer can accumulate avoidable backlog.
+            if Instant::now() >= deadline {
+                saturating_increment(&mut self.statistics.receive_timeouts);
+                return Err(TransportError::TimedOut);
+            }
+            if let Some(frame) = self.ring.pop() {
+                return Ok(frame);
+            }
             if self.drain_socket(deadline)? == DrainPassOutcome::DeadlineExpired
                 || Instant::now() >= deadline
             {
@@ -574,7 +658,7 @@ impl Transport for LinuxRawEthernetTransport {
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(other(format!("AF_PACKET poll failed: {error}")));
+                return Err(TransportError::from_io("poll", error));
             }
             if result == 0 {
                 self.statistics.receive_timeouts =
@@ -642,8 +726,8 @@ fn poll_timeout_milliseconds(now: Instant, deadline: Instant) -> libc::c_int {
     i32::try_from(milliseconds).unwrap_or(i32::MAX)
 }
 
-fn last_os_error(context: &str) -> TransportError {
-    other(format!("{context}: {}", io::Error::last_os_error()))
+fn last_os_error(context: &'static str) -> TransportError {
+    TransportError::from_io(context, io::Error::last_os_error())
 }
 
 fn other(message: String) -> TransportError {
@@ -1030,6 +1114,25 @@ mod tests {
             closed: false,
             next_ipv4_identification: 0,
         }
+    }
+
+    #[test]
+    fn diagnostic_refresh_failure_does_not_discard_a_buffered_packet() {
+        let mut transport = transport_with_descriptor(i32::MAX, true);
+        let frame = ReceivedFrame {
+            payload: vec![1],
+            sender: transport.config.board().network(),
+        };
+        // Fill the ring so draining does not touch the injected invalid socket.
+        for _ in 0..transport.ring.capacity() {
+            transport.ring.push(frame.clone());
+        }
+        transport
+            .drain_socket(Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(transport.statistics.statistics_failures, 1);
+        assert_eq!(transport.ring.pop(), Some(frame));
+        transport.socket.0 = -1;
     }
 
     #[test]

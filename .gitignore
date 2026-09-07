@@ -6,3 +6,6 @@
 __pycache__/
 *.so
 *.pyd
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/

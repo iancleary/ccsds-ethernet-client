@@ -14,6 +14,14 @@ WORKFLOW = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_wheels_execute_on_native_architectures_before_upload(self) -> None:
+        wheels = WORKFLOW[WORKFLOW.index("  build-python-wheels:"):WORKFLOW.index("  build-python-sdist:")]
+        self.assertIn("runs-on: ${{ matrix.runner }}", wheels)
+        self.assertIn("target: aarch64-unknown-linux-gnu\n            runner: ubuntu-24.04-arm", wheels)
+        self.assertIn("target: x86_64-unknown-linux-gnu\n            runner: ubuntu-latest", wheels)
+        self.assertLess(wheels.index("scripts/test_linux_live.py --python"), wheels.index("Store Python wheel"))
+        self.assertIn("--no-deps dist/*.whl", wheels)
+
     def test_all_artifacts_are_built_before_the_first_publish(self) -> None:
         self.assertIn(
             "needs: [verify, build-python-wheels, build-python-sdist]",

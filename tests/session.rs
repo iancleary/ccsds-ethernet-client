@@ -96,6 +96,100 @@ fn future_deadline() -> Instant {
 }
 
 #[test]
+fn reused_correlation_cannot_distinguish_a_stale_acknowledgement() {
+    // This documents the codec boundary, not a transport freshness guarantee.
+    // Consumers must choose distinct identities while old responses can exist.
+    let transport = MemoryTransport::with_incoming([frame(&[0x20, 1, 0]), frame(&[0x20, 1, 9])]);
+    let mut session = Session::from_transport(TestCodec, transport, remote()).unwrap();
+    assert_eq!(
+        session
+            .exchange_once(&Command(1), future_deadline())
+            .unwrap()
+            .status,
+        0
+    );
+    assert_eq!(
+        session
+            .exchange_once(&Command(1), future_deadline())
+            .unwrap()
+            .status,
+        9
+    );
+}
+
+#[test]
+fn diagnostics_survive_unknown_delivery_and_telemetry_receive() {
+    let transport =
+        MemoryTransport::with_incoming([frame(&[0x20]), frame(&[0x20, 8, 0]), frame(&[0xff])]);
+    let mut session = Session::from_transport(TestCodec, transport, remote()).unwrap();
+    assert!(
+        session
+            .exchange_once(&Command(9), future_deadline())
+            .unwrap_err()
+            .delivery_outcome_unknown()
+    );
+    let diagnostics = session.statistics().diagnostics();
+    assert_eq!(diagnostics.decode_failures, 1);
+    assert_eq!(diagnostics.unmatched_acknowledgements, 1);
+    assert_eq!(diagnostics.ignored_messages, 1);
+    assert_eq!(session.into_transport().sent_payloads().len(), 1);
+
+    let transport = MemoryTransport::with_incoming([
+        frame(&[0x20]),
+        frame(&[0x20, 8, 0]),
+        frame(&[0xff]),
+        frame(&[0x30, 7]),
+    ]);
+    let mut session = Session::from_transport(TestCodec, transport, remote()).unwrap();
+    assert_eq!(session.next_telemetry(future_deadline()), Ok(Telemetry(7)));
+    assert_eq!(session.statistics().diagnostics(), diagnostics);
+}
+
+#[test]
+fn distinct_request_identity_rejects_delayed_duplicate_ack() {
+    let transport = MemoryTransport::with_incoming([
+        frame(&[0x20, 8, 0]),
+        frame(&[0x20, 8, 0]),
+        frame(&[0x20, 9, 0]),
+    ]);
+    let mut session = Session::from_transport(TestCodec, transport, remote()).unwrap();
+    assert_eq!(
+        session
+            .exchange_once(&Command(8), future_deadline())
+            .unwrap()
+            .request,
+        8
+    );
+    assert_eq!(
+        session
+            .exchange_once(&Command(9), future_deadline())
+            .unwrap()
+            .request,
+        9
+    );
+    assert_eq!(
+        session
+            .statistics()
+            .diagnostics()
+            .unmatched_acknowledgements,
+        1
+    );
+}
+
+#[test]
+fn os_error_preserves_machine_readable_evidence() {
+    let error = TransportError::from_io("send", std::io::Error::from_raw_os_error(13));
+    assert!(matches!(
+        error,
+        TransportError::Io {
+            operation: "send",
+            raw_os_error: Some(13),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn exchange_starts_receive_first_correlates_and_preserves_typed_results() {
     let transport = MemoryTransport::with_incoming([
         frame(&[0x30, 7]),
