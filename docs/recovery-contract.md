@@ -35,6 +35,9 @@ as `ipv4_checksum_policy`. Validate peer compatibility before requiring them.
 IPv6 always requires UDP checksums. Checksums do not authenticate packets;
 consumer protocols own end-to-end integrity and replay protection.
 
+See [checksum qualification](checksum-qualification.md) for automated evidence,
+the policy acceptance matrix, and the later physical-peer procedure.
+
 Live transport tests run with `just linux-test` on Linux in a disposable network
 namespace. They need iproute2 and namespace permissions, never a physical NIC.
 Normal `just check` remains hardware-free and root-free.

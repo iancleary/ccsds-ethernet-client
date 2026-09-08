@@ -2,8 +2,9 @@
 #![cfg(target_os = "linux")]
 
 use ccsds_ethernet_client::{
-    Codec, DecodeResult, DecodedMessage, EncodedCommand, Endpoint, LinuxRawEthernetTransport,
-    MacAddress, RawEthernetConfig, RawEthernetEndpoint, Session, Transport,
+    Codec, DecodeResult, DecodedMessage, EncodedCommand, Endpoint, Ipv4ChecksumPolicy,
+    LinuxRawEthernetTransport, MacAddress, RawEthernetConfig, RawEthernetEndpoint, Session,
+    Transport, TransportError,
 };
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -38,6 +39,18 @@ impl Codec for TestCodec {
 }
 
 fn pair(capacity: usize) -> (LinuxRawEthernetTransport, LinuxRawEthernetTransport) {
+    pair_with_policies(
+        capacity,
+        Ipv4ChecksumPolicy::Legacy,
+        Ipv4ChecksumPolicy::Legacy,
+    )
+}
+
+fn pair_with_policies(
+    capacity: usize,
+    receiver_policy: Ipv4ChecksumPolicy,
+    sender_policy: Ipv4ChecksumPolicy,
+) -> (LinuxRawEthernetTransport, LinuxRawEthernetTransport) {
     assert_eq!(std::env::var("CCSDS_LIVE_TEST").as_deref(), Ok("1"));
     let host = RawEthernetEndpoint::new(
         MacAddress::new([2, 0, 0, 0, 0, 1]),
@@ -50,16 +63,53 @@ fn pair(capacity: usize) -> (LinuxRawEthernetTransport, LinuxRawEthernetTranspor
     )
     .unwrap();
     let mut receiver = LinuxRawEthernetTransport::open(
-        RawEthernetConfig::new(2, "ccsds-host", host, peer, capacity).unwrap(),
+        RawEthernetConfig::new(2, "ccsds-host", host, peer, capacity)
+            .unwrap()
+            .with_ipv4_checksum_policy(receiver_policy),
     )
     .unwrap();
     let mut sender = LinuxRawEthernetTransport::open(
-        RawEthernetConfig::new(2, "ccsds-peer", peer, host, capacity).unwrap(),
+        RawEthernetConfig::new(2, "ccsds-peer", peer, host, capacity)
+            .unwrap()
+            .with_ipv4_checksum_policy(sender_policy),
     )
     .unwrap();
     receiver.start_receive().unwrap();
     sender.start_receive().unwrap();
     (receiver, sender)
+}
+
+#[test]
+#[ignore = "requires isolated Linux veth fixture"]
+fn ipv4_checksum_policy_matrix_over_packet_sockets() {
+    use Ipv4ChecksumPolicy::{Generate, Legacy, Require};
+    for receiver_policy in [Legacy, Generate, Require] {
+        for sender_policy in [Legacy, Generate, Require] {
+            let (mut receiver, mut sender) = pair_with_policies(8, receiver_policy, sender_policy);
+            let rejects_zero = receiver_policy == Require && sender_policy == Legacy;
+            for length in [0, 1, 2, 1471, 1472] {
+                let payload = vec![0xa5; length];
+                sender.send(&payload).unwrap();
+                let received = receiver.receive(Instant::now() + Duration::from_millis(100));
+                if rejects_zero {
+                    assert!(matches!(received, Err(TransportError::TimedOut)));
+                } else {
+                    assert_eq!(received.unwrap().payload, payload);
+                }
+            }
+            assert_eq!(
+                receiver.statistics().invalid_frames,
+                if rejects_zero { 5 } else { 0 }
+            );
+            assert_eq!(
+                receiver.statistics().received_frames,
+                if rejects_zero { 0 } else { 5 }
+            );
+            assert_eq!(receiver.statistics().kernel_dropped_frames, 0);
+            receiver.close().unwrap();
+            sender.close().unwrap();
+        }
+    }
 }
 
 #[test]

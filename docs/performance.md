@@ -33,6 +33,11 @@ compatibility result is claimed here.
 
 ## Optimization gates
 
+The first allocation comparison is recorded in
+[Checksum allocation evaluation](performance-checksum.md). It supports removing
+temporary checksum buffers. CPU and latency ranges overlap, and it does not
+establish a throughput improvement or a physical-link acceptance limit.
+
 Do not enable kernel filtering by default yet. Filtering can remove frames
 before observation counters see them. Define counter scope and compare the
 same workloads with and without the filter before changing that contract.

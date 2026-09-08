@@ -127,6 +127,105 @@ fn set_udp_checksum(frame: &mut [u8]) {
     frame[40..42].copy_from_slice(&if value == 0 { 0xffff } else { value }.to_be_bytes());
 }
 
+// Independent oracle: concatenate the on-wire pseudo-header and UDP bytes.
+// This deliberately retains the allocation that production no longer needs.
+fn reference_udp_checksum(frame: &[u8], ipv6: bool) -> u16 {
+    let udp = if ipv6 { 54 } else { 34 };
+    let length = u16::from_be_bytes([frame[udp + 4], frame[udp + 5]]);
+    let mut pseudo = Vec::new();
+    if ipv6 {
+        pseudo.extend_from_slice(&frame[22..54]);
+        pseudo.extend_from_slice(&u32::from(length).to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 17]);
+    } else {
+        pseudo.extend_from_slice(&frame[26..34]);
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&length.to_be_bytes());
+    }
+    let header_length = pseudo.len();
+    pseudo.extend_from_slice(&frame[udp..udp + usize::from(length)]);
+    pseudo[header_length + 6..header_length + 8].fill(0);
+    checksum(&pseudo)
+}
+
+#[test]
+fn checksums_match_concatenated_oracle_for_every_supported_payload_length() {
+    use ccsds_ethernet_client::Ipv4ChecksumPolicy;
+
+    for (selected, options, ipv6) in [
+        (config(), IpPacketOptions::Ipv4 { identification: 7 }, false),
+        (ipv6_config(), IpPacketOptions::Ipv6, true),
+    ] {
+        let selected = selected.with_ipv4_checksum_policy(Ipv4ChecksumPolicy::Require);
+        let reverse = RawEthernetConfig::new(2, "eth0", selected.board(), selected.host(), 8)
+            .unwrap()
+            .with_ipv4_checksum_policy(Ipv4ChecksumPolicy::Generate);
+        let udp = if ipv6 { 54 } else { 34 };
+        for length in 0..=selected.maximum_udp_payload_bytes() {
+            let payload: Vec<_> = (0..length)
+                .map(|i| (i.wrapping_mul(197) ^ length) as u8)
+                .collect();
+            let mut frame = build_udp_frame(&reverse, &payload, options).unwrap();
+            let expected = reference_udp_checksum(&frame, ipv6);
+            let expected = if expected == 0 { 0xffff } else { expected };
+            assert_eq!(
+                &frame[udp + 6..udp + 8],
+                &expected.to_be_bytes(),
+                "IPv6={ipv6}, length={length}"
+            );
+            // Ethernet padding is outside the checksum and the returned payload.
+            frame[udp + 8 + length..].fill(0xa5);
+            assert_eq!(
+                parse_udp_frame(&frame, &selected),
+                FrameDisposition::Matched {
+                    payload,
+                    sender: selected.board().network(),
+                }
+            );
+            if length > 0 {
+                frame[udp + 8 + length - 1] ^= 1;
+                let error = if ipv6 {
+                    EthernetError::InvalidIpv6UdpChecksum
+                } else {
+                    EthernetError::InvalidUdpChecksum
+                };
+                assert_eq!(
+                    parse_udp_frame(&frame, &selected),
+                    FrameDisposition::Invalid(error)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn computed_zero_udp_checksum_is_transmitted_as_all_ones() {
+    use ccsds_ethernet_client::Ipv4ChecksumPolicy;
+
+    for (selected, options, ipv6) in [
+        (config(), IpPacketOptions::Ipv4 { identification: 7 }, false),
+        (ipv6_config(), IpPacketOptions::Ipv6, true),
+    ] {
+        let selected = selected.with_ipv4_checksum_policy(Ipv4ChecksumPolicy::Require);
+        let reverse = RawEthernetConfig::new(2, "eth0", selected.board(), selected.host(), 8)
+            .unwrap()
+            .with_ipv4_checksum_policy(Ipv4ChecksumPolicy::Generate);
+        let initial = build_udp_frame(&reverse, &[0, 0], options).unwrap();
+        let payload = reference_udp_checksum(&initial, ipv6).to_be_bytes();
+        let frame = build_udp_frame(&reverse, &payload, options).unwrap();
+        let udp = if ipv6 { 54 } else { 34 };
+        assert_eq!(reference_udp_checksum(&frame, ipv6), 0);
+        assert_eq!(&frame[udp + 6..udp + 8], &[0xff, 0xff]);
+        assert_eq!(
+            parse_udp_frame(&frame, &selected),
+            FrameDisposition::Matched {
+                payload: payload.to_vec(),
+                sender: selected.board().network(),
+            }
+        );
+    }
+}
+
 #[test]
 fn config_rejects_ambiguous_or_unsupported_identity() {
     assert!(MacAddress::from_str("02:00:00:00:00:7a").is_ok());
