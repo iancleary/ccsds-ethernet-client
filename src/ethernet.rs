@@ -393,13 +393,11 @@ fn build_ipv4_udp_frame(
     // IPv4 permits a zero UDP checksum; retain it only in legacy transmit mode.
     frame[udp + UDP_HEADER_BYTES..udp + usize::from(udp_length)].copy_from_slice(payload);
     if config.ipv4_checksum_policy != Ipv4ChecksumPolicy::Legacy {
-        let mut pseudo = Vec::with_capacity(12 + usize::from(udp_length));
-        pseudo.extend_from_slice(&host.octets());
-        pseudo.extend_from_slice(&board.octets());
-        pseudo.extend_from_slice(&[0, IP_PROTOCOL_UDP]);
-        pseudo.extend_from_slice(&udp_length.to_be_bytes());
-        pseudo.extend_from_slice(&frame[udp..udp + usize::from(udp_length)]);
-        let checksum = internet_checksum(&pseudo);
+        let checksum = udp_checksum_ipv4(
+            &host.octets(),
+            &board.octets(),
+            &frame[udp..udp + usize::from(udp_length)],
+        );
         frame[udp + 6..udp + 8]
             .copy_from_slice(&if checksum == 0 { 0xffff } else { checksum }.to_be_bytes());
     }
@@ -620,6 +618,12 @@ fn parse_ipv6_udp_frame(frame: &[u8], config: &RawEthernetConfig) -> FrameDispos
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
+    finish_checksum(checksum_sum(bytes))
+}
+
+// Callers bound inputs to the standard MTU before checksumming. Even the
+// maximum pseudo-header plus UDP packet fits comfortably in this u32 sum.
+fn checksum_sum(bytes: &[u8]) -> u32 {
     let mut sum = 0_u32;
     for chunk in bytes.chunks(2) {
         let word = if chunk.len() == 2 {
@@ -629,6 +633,10 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
         };
         sum += u32::from(word);
     }
+    sum
+}
+
+fn finish_checksum(mut sum: u32) -> u16 {
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -636,35 +644,39 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 }
 
 fn udp_checksum_valid(source: &[u8], destination: &[u8], udp: &[u8]) -> bool {
-    let mut pseudo = Vec::with_capacity(12 + udp.len());
-    pseudo.extend_from_slice(source);
-    pseudo.extend_from_slice(destination);
-    pseudo.push(0);
-    pseudo.push(IP_PROTOCOL_UDP);
-    pseudo.extend_from_slice(&(udp.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(udp);
-    internet_checksum(&pseudo) == 0
+    udp_checksum_ipv4(source, destination, udp) == 0
+}
+
+fn udp_checksum_ipv4(source: &[u8], destination: &[u8], udp: &[u8]) -> u16 {
+    // RFC 1071 section 2(A): add partial sums at even byte boundaries.
+    // Addresses and pseudo-header fields are even-sized; only UDP may end
+    // with an odd byte. checksum_sum pads that final byte exactly once.
+    finish_checksum(
+        checksum_sum(source)
+            + checksum_sum(destination)
+            + u32::from(IP_PROTOCOL_UDP)
+            + udp.len() as u32
+            + checksum_sum(udp),
+    )
 }
 
 fn udp_checksum_ipv6(source: &[u8; 16], destination: &[u8; 16], udp: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(40 + udp.len());
-    pseudo.extend_from_slice(source);
-    pseudo.extend_from_slice(destination);
-    pseudo.extend_from_slice(&(udp.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0]);
-    pseudo.push(IP_PROTOCOL_UDP);
-    pseudo.extend_from_slice(udp);
-    let checksum = internet_checksum(&pseudo);
+    let checksum = udp_checksum_ipv6_raw(source, destination, udp);
     if checksum == 0 { 0xffff } else { checksum }
 }
 
 fn udp_checksum_valid_ipv6(source: &[u8], destination: &[u8], udp: &[u8]) -> bool {
-    let mut pseudo = Vec::with_capacity(40 + udp.len());
-    pseudo.extend_from_slice(source);
-    pseudo.extend_from_slice(destination);
-    pseudo.extend_from_slice(&(udp.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0]);
-    pseudo.push(IP_PROTOCOL_UDP);
-    pseudo.extend_from_slice(udp);
-    internet_checksum(&pseudo) == 0
+    udp_checksum_ipv6_raw(source, destination, udp) == 0
+}
+
+fn udp_checksum_ipv6_raw(source: &[u8], destination: &[u8], udp: &[u8]) -> u16 {
+    let length = udp.len() as u32;
+    finish_checksum(
+        checksum_sum(source)
+            + checksum_sum(destination)
+            + (length >> 16)
+            + (length & 0xffff)
+            + u32::from(IP_PROTOCOL_UDP)
+            + checksum_sum(udp),
+    )
 }
