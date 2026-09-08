@@ -27,6 +27,9 @@ framework around it.
 - `fuzz/` holds the arbitrary and structured frame-parser fuzz target.
   `docs/recovery-contract.md` defines correlation and explicit recovery rules.
   `docs/performance.md` records measurement limits and optimization gates.
+- `examples/transport_benchmark.rs` and `examples/benchmark_support/` own
+  the standalone workload generator, synthetic peer, and instrumentation.
+  `scripts/test_transport_benchmark.py` verifies its JSON and accounting contract.
 - `docs/release.md`, `scripts/cut_release.py`, and
   `scripts/test_cut_release.py` own local release behavior. The release
   workflow and `scripts/test_release_workflow.py` own registry publication
@@ -58,6 +61,9 @@ Preserve these unless the pull request explicitly changes the public contract:
 - The Linux transport uses an interface-bound `AF_PACKET` raw socket. Live use
   requires Linux and deployment-managed `CAP_NET_RAW`; default tests must stay
   hardware-free and root-free.
+- Benchmark-only unsafe allocator and CPU-clock instrumentation may live in
+  `examples/benchmark_support/meter.rs`. It must not enter the library or
+  change transport behavior. Report process-wide overhead, not library-only cost.
 - `Session::from_transport` starts receive before any send can happen.
   `exchange_once` sends at most once, uses an absolute monotonic deadline, and
   distinguishes an expired pre-send deadline from a post-send unknown delivery
