@@ -324,6 +324,20 @@ pub fn build_udp_frame(
     payload: &[u8],
     options: IpPacketOptions,
 ) -> Result<Vec<u8>, EthernetError> {
+    let mut frame = Vec::new();
+    build_udp_frame_into(config, payload, options, &mut frame)?;
+    Ok(frame)
+}
+
+pub(crate) fn build_udp_frame_into(
+    config: &RawEthernetConfig,
+    payload: &[u8],
+    options: IpPacketOptions,
+    frame: &mut Vec<u8>,
+) -> Result<(), EthernetError> {
+    // Reset the visible length before validation. Resizing from zero below
+    // initializes every transmitted byte, including headers and padding.
+    frame.clear();
     config.validate()?;
     match (
         config.host().network().ip(),
@@ -331,10 +345,10 @@ pub fn build_udp_frame(
         options,
     ) {
         (IpAddr::V4(_), IpAddr::V4(_), IpPacketOptions::Ipv4 { identification }) => {
-            build_ipv4_udp_frame(config, payload, identification)
+            build_ipv4_udp_frame(config, payload, identification, frame)
         }
         (IpAddr::V6(_), IpAddr::V6(_), IpPacketOptions::Ipv6) => {
-            build_ipv6_udp_frame(config, payload)
+            build_ipv6_udp_frame(config, payload, frame)
         }
         (host, board, _) if host.is_ipv4() != board.is_ipv4() => {
             Err(EthernetError::MixedIpFamilies { host, board })
@@ -347,7 +361,8 @@ fn build_ipv4_udp_frame(
     config: &RawEthernetConfig,
     payload: &[u8],
     ipv4_identification: u16,
-) -> Result<Vec<u8>, EthernetError> {
+    frame: &mut Vec<u8>,
+) -> Result<(), EthernetError> {
     if payload.len() > STANDARD_MTU_IPV4_UDP_PAYLOAD_BYTES {
         return Err(EthernetError::PayloadTooLarge(payload.len()));
     }
@@ -358,7 +373,7 @@ fn build_ipv4_udp_frame(
     let ip_length = u16::try_from(IPV4_HEADER_BYTES + usize::from(udp_length))
         .map_err(|_| EthernetError::PayloadTooLarge(payload.len()))?;
     let frame_length = ETHERNET_HEADER_BYTES + usize::from(ip_length);
-    let mut frame = vec![0_u8; frame_length.max(MINIMUM_ETHERNET_FRAME_BYTES)];
+    frame.resize(frame_length.max(MINIMUM_ETHERNET_FRAME_BYTES), 0);
 
     frame[0..6].copy_from_slice(&config.board.mac.octets());
     frame[6..12].copy_from_slice(&config.host.mac.octets());
@@ -401,13 +416,14 @@ fn build_ipv4_udp_frame(
         frame[udp + 6..udp + 8]
             .copy_from_slice(&if checksum == 0 { 0xffff } else { checksum }.to_be_bytes());
     }
-    Ok(frame)
+    Ok(())
 }
 
 fn build_ipv6_udp_frame(
     config: &RawEthernetConfig,
     payload: &[u8],
-) -> Result<Vec<u8>, EthernetError> {
+    frame: &mut Vec<u8>,
+) -> Result<(), EthernetError> {
     if payload.len() > STANDARD_MTU_IPV6_UDP_PAYLOAD_BYTES {
         return Err(EthernetError::PayloadTooLarge(payload.len()));
     }
@@ -416,7 +432,7 @@ fn build_ipv6_udp_frame(
         .and_then(|length| u16::try_from(length).ok())
         .ok_or(EthernetError::PayloadTooLarge(payload.len()))?;
     let frame_length = ETHERNET_HEADER_BYTES + IPV6_HEADER_BYTES + usize::from(udp_length);
-    let mut frame = vec![0_u8; frame_length.max(MINIMUM_ETHERNET_FRAME_BYTES)];
+    frame.resize(frame_length.max(MINIMUM_ETHERNET_FRAME_BYTES), 0);
 
     frame[0..6].copy_from_slice(&config.board.mac.octets());
     frame[6..12].copy_from_slice(&config.host.mac.octets());
@@ -451,7 +467,7 @@ fn build_ipv6_udp_frame(
         &frame[udp..udp + usize::from(udp_length)],
     );
     frame[udp + 6..udp + 8].copy_from_slice(&checksum.to_be_bytes());
-    Ok(frame)
+    Ok(())
 }
 
 pub fn parse_udp_frame(frame: &[u8], config: &RawEthernetConfig) -> FrameDisposition {
@@ -679,4 +695,83 @@ fn udp_checksum_ipv6_raw(source: &[u8], destination: &[u8], udp: &[u8]) -> u16 {
             + u32::from(IP_PROTOCOL_UDP)
             + checksum_sum(udp),
     )
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn reused_frame_storage_matches_fresh_frames_and_clears_after_rejection() {
+        let families = [
+            (
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                IpPacketOptions::Ipv4 { identification: 17 },
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+                IpPacketOptions::Ipv6,
+            ),
+        ];
+        let mut buffer = vec![0xcc; 2048];
+        let pointer = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        for (host, peer, options) in families {
+            for policy in [
+                Ipv4ChecksumPolicy::Legacy,
+                Ipv4ChecksumPolicy::Generate,
+                Ipv4ChecksumPolicy::Require,
+            ] {
+                let config = RawEthernetConfig::new(
+                    2,
+                    "eth0",
+                    RawEthernetEndpoint::new(
+                        MacAddress::new([2, 0, 0, 0, 0, 1]),
+                        Endpoint::new(host, 40001).unwrap(),
+                    )
+                    .unwrap(),
+                    RawEthernetEndpoint::new(
+                        MacAddress::new([2, 0, 0, 0, 0, 2]),
+                        Endpoint::new(peer, 40002).unwrap(),
+                    )
+                    .unwrap(),
+                    8,
+                )
+                .unwrap()
+                .with_ipv4_checksum_policy(policy);
+                let maximum = config.maximum_udp_payload_bytes();
+                for length in [maximum, 0, 1, maximum - 1, 2, 17, 0] {
+                    let payload = vec![length as u8 ^ 0xa5; length];
+                    build_udp_frame_into(&config, &payload, options, &mut buffer).unwrap();
+                    assert_eq!(buffer, build_udp_frame(&config, &payload, options).unwrap());
+                    assert_eq!(buffer.as_ptr(), pointer, "frame storage must be reused");
+                    assert_eq!(buffer.capacity(), capacity);
+                }
+                assert!(matches!(
+                    build_udp_frame_into(&config, &vec![0; maximum + 1], options, &mut buffer),
+                    Err(EthernetError::PayloadTooLarge(_))
+                ));
+                assert!(
+                    buffer.is_empty(),
+                    "rejected input must not leave a sendable old frame"
+                );
+                build_udp_frame_into(&config, &[0x5a], options, &mut buffer).unwrap();
+                assert_eq!(buffer, build_udp_frame(&config, &[0x5a], options).unwrap());
+                let wrong_family = if host.is_ipv4() {
+                    IpPacketOptions::Ipv6
+                } else {
+                    IpPacketOptions::Ipv4 { identification: 0 }
+                };
+                assert_eq!(
+                    build_udp_frame_into(&config, &[], wrong_family, &mut buffer),
+                    Err(EthernetError::PacketOptionsFamilyMismatch)
+                );
+                assert!(buffer.is_empty());
+                assert_eq!(buffer.as_ptr(), pointer);
+            }
+        }
+    }
 }
