@@ -68,7 +68,9 @@ jobs:
           cargo test --locked --all-targets
           cargo test --locked --doc
       - name: Test Linux packet sockets in isolation
-        run: just linux-test
+        run: |
+          just linux-test
+          just linux-benchmark-check
       - name: Check Python bindings
         run: |
           PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings

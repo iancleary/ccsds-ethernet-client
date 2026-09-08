@@ -14,6 +14,20 @@ test:
 linux-test *args:
     python3 scripts/test_linux_live.py "$@"
 
+# Root-free workload simulation; JSON Lines go to stdout.
+[positional-arguments]
+benchmark *args:
+    cargo run --quiet --locked --release --example transport_benchmark -- "$@"
+
+# Actual packet transport in a disposable Linux veth fixture.
+[positional-arguments]
+linux-benchmark *args:
+    python3 scripts/test_linux_live.py --release --benchmark "$@"
+
+# Verify benchmark accounting with simulation and the isolated packet transport.
+linux-benchmark-check:
+    CCSDS_BENCHMARK_VETH=1 uv run scripts/test_transport_benchmark.py
+
 # Build the extension and run hardware-free Python contract tests.
 python-test:
     uv run --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc 'maturin develop --locked; python -m unittest discover -s python/tests -v'
@@ -28,6 +42,7 @@ check:
     just python-test
     uv run scripts/test_cut_release.py
     uv run scripts/test_release_workflow.py
+    uv run scripts/test_transport_benchmark.py
     git diff --check -- .
 
 # Validate and create a SemVer GitHub release.

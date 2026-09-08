@@ -158,6 +158,11 @@ Use `just linux-test` for isolated Linux packet-socket tests. See
 [performance evidence](docs/performance.md) for the virtual-link baseline and
 the measurements required before throughput optimizations.
 
+Use `just benchmark` for configurable root-free workloads, or
+`just linux-benchmark` for the packet transport in a disposable veth fixture.
+Both emit JSON Lines. See the [benchmark contract](docs/benchmark.md) for traffic,
+fault injection, measurement scope, and later peer-adapter requirements.
+
 ## Maintenance
 
 Future agent and maintainer workflow guidance lives in

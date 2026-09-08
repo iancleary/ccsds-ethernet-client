@@ -1,5 +1,11 @@
 # Performance evidence and next measurements
 
+The configurable generator and synthetic peer are documented in
+[Transport workload benchmark](benchmark.md). Use `just benchmark` for root-free
+simulation and `just linux-benchmark` for the actual transport on disposable
+virtual interfaces. They report JSON Lines with load, latency, telemetry age,
+loss, queues, process CPU/allocation counts, and explicit reopen timing.
+
 Run the virtual-link baseline on Linux:
 
 ```sh
@@ -18,12 +24,12 @@ only proves the measurement path works. Do not use it as an acceptance limit or
 compare it to an optimized build. Keep the build profile, kernel, CPU, load,
 payload size, checksum policy, queue sizes, and complete output with future runs.
 
-The full workload benchmark remains open. Measure telemetry age, offered-rate
-loss thresholds, queue high-water marks, CPU time, allocations per packet, and
-recovery time. Cover idle periods, steady traffic, bursts, maximum payloads,
-unrelated traffic, peer resets, and interface replacement. Use externally
-defined workloads and acceptance limits. No physical-link measurement or
-peer-specific checksum compatibility result is claimed here.
+The workload harness is available; representative physical-link qualification
+remains open. Define workloads and acceptance limits before interpreting its
+sampled loss observations. Cover idle periods, steady traffic, bursts, maximum
+payloads, unrelated traffic, peer resets, and interface replacement with the
+appropriate peer adapter. No physical-link measurement or peer-specific checksum
+compatibility result is claimed here.
 
 ## Optimization gates
 
