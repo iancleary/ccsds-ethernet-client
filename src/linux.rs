@@ -19,7 +19,7 @@ use crate::ethernet::{
     IpPacketOptions,
     MacAddress,
     RawEthernetConfig,
-    build_udp_frame,
+    build_udp_frame_into,
     parse_udp_frame,
 };
 #[rustfmt::skip]
@@ -187,6 +187,7 @@ pub struct LinuxRawEthernetTransport {
     receive_ready: bool,
     closed: bool,
     next_ipv4_identification: u16,
+    send_buffer: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,6 +380,7 @@ impl LinuxRawEthernetTransport {
             receive_ready: false,
             closed: false,
             next_ipv4_identification: 0,
+            send_buffer: Vec::with_capacity(MAXIMUM_FRAME_BYTES),
         })
     }
 
@@ -595,8 +597,9 @@ impl Transport for LinuxRawEthernetTransport {
         } else {
             IpPacketOptions::Ipv6
         };
-        let frame = build_udp_frame(&self.config, payload, options)
+        build_udp_frame_into(&self.config, payload, options, &mut self.send_buffer)
             .map_err(|error| other(error.to_string()))?;
+        let frame = &self.send_buffer;
         // SAFETY: `frame` remains live and immutable for the duration of send.
         let sent = unsafe {
             libc::send(
@@ -777,7 +780,7 @@ mod tests {
             config.ring_capacity(),
         )
         .expect("reverse config");
-        build_udp_frame(
+        crate::ethernet::build_udp_frame(
             &reverse,
             payload,
             IpPacketOptions::Ipv4 { identification: 7 },
@@ -1113,6 +1116,7 @@ mod tests {
             receive_ready,
             closed: false,
             next_ipv4_identification: 0,
+            send_buffer: Vec::with_capacity(MAXIMUM_FRAME_BYTES),
         }
     }
 

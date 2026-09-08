@@ -114,6 +114,41 @@ fn ipv4_checksum_policy_matrix_over_packet_sockets() {
 
 #[test]
 #[ignore = "requires isolated Linux veth fixture"]
+fn successive_sends_resize_storage_and_recover_after_oversized_input() {
+    let (mut receiver, mut sender) =
+        pair_with_policies(8, Ipv4ChecksumPolicy::Require, Ipv4ChecksumPolicy::Generate);
+    for length in [1472, 0, 1, 1471, 2, 17, 0] {
+        let payload = vec![length as u8 ^ 0xa5; length];
+        sender.send(&payload).unwrap();
+        assert_eq!(
+            receiver
+                .receive(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                .payload,
+            payload
+        );
+    }
+    assert!(sender.send(&[0x55; 1473]).is_err());
+    assert_eq!(sender.statistics().sent_frames, 7);
+    sender.send(&[0x42]).unwrap();
+    assert_eq!(
+        receiver
+            .receive(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .payload,
+        [0x42]
+    );
+    assert_eq!(sender.statistics().sent_frames, 8);
+    assert!(matches!(
+        receiver.receive(Instant::now() + Duration::from_millis(20)),
+        Err(TransportError::TimedOut)
+    ));
+    assert_eq!(receiver.statistics().received_frames, 8);
+    assert_eq!(receiver.statistics().invalid_frames, 0);
+}
+
+#[test]
+#[ignore = "requires isolated Linux veth fixture"]
 fn burst_larger_than_ring_preserves_all_packets_including_ack() {
     for capacity in [1, 8] {
         for ack_position in [0, 8, 16] {
