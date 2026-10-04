@@ -43,7 +43,7 @@ test:
 # Requires Linux, iproute2, and permission to create disposable network namespaces.
 [positional-arguments]
 linux-test *args:
-    python3 scripts/test_linux_live.py "$@"
+    uv run --managed-python --python 3.11 --isolated --no-project scripts/test_linux_live.py "$@"
 
 # Root-free workload simulation; JSON Lines go to stdout.
 [positional-arguments]
@@ -53,21 +53,22 @@ benchmark *args:
 # Actual packet transport in a disposable Linux veth fixture.
 [positional-arguments]
 linux-benchmark *args:
-    python3 scripts/test_linux_live.py --release --benchmark "$@"
+    uv run --managed-python --python 3.11 --isolated --no-project scripts/test_linux_live.py --release --benchmark "$@"
 
 # Verify benchmark accounting with simulation and the isolated packet transport.
 linux-benchmark-check:
-    CCSDS_BENCHMARK_VETH=1 uv run scripts/test_transport_benchmark.py
+    CCSDS_BENCHMARK_VETH=1 uv run --managed-python --python 3.11 scripts/test_transport_benchmark.py
 
 # Build the extension and run hardware-free Python contract tests.
 python-test:
-    uv run --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc 'maturin develop --locked; python -m unittest discover -s python/tests -v'
+    uv run --managed-python --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc 'maturin develop --locked; python -m unittest discover -s python/tests -v'
 
 # Verify release tooling, benchmark accounting, and patch whitespace.
 policy-check:
-    uv run scripts/test_cut_release.py
-    uv run scripts/test_release_workflow.py
-    uv run scripts/test_transport_benchmark.py
+    uv run --managed-python --python 3.11 scripts/test_cut_release.py
+    uv run --managed-python --python 3.11 scripts/test_release_workflow.py
+    uv run --managed-python --python 3.11 scripts/test_transport_benchmark.py
+    uv run --managed-python --python 3.11 scripts/test_task_runtime.py
     git diff --check -- .
 
 # Run all hardware-free validation, including the Python contract.
@@ -79,4 +80,4 @@ ci: check build
 # Validate and create a SemVer GitHub release.
 [positional-arguments]
 cut-release *args:
-    uv run scripts/cut_release.py "$@"
+    uv run --managed-python --python 3.11 scripts/cut_release.py "$@"
