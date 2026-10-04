@@ -151,6 +151,14 @@ for request identity, checksum policy, diagnostics, and recovery semantics.
 just check
 ```
 
+`just help` lists the supported interface. Use `just fmt` (or `just format`)
+to format code. `just fmt-check`, `just lint`, `just test`, `just doc-check`,
+and `just package` run individual Rust checks. `just check` also validates the
+Python binding, release tooling, benchmark accounting, and patch whitespace.
+`just build` creates a release build; `just ci` runs `check` and `build`.
+Package verification requires committed source. These checks do not publish
+artifacts or open a NIC. Linux transport checks remain explicit opt-in tasks.
+
 Use `just python-test` to run only the extension build and hardware-free Python
 contract tests.
 

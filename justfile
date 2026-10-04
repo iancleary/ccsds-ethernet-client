@@ -1,8 +1,39 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Show the available recipes.
-default:
+default: help
+
+# Show the available recipes.
+help:
     @just --list
+
+# Format the Rust code.
+fmt:
+    cargo fmt --all
+
+# Alias for fmt.
+format: fmt
+
+# Check formatting without writing changes.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Lint the default crate and optional Python binding without writing changes.
+lint:
+    cargo clippy --locked --all-targets -- -D warnings
+    PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
+
+# Check documentation with rustdoc warnings denied.
+doc-check:
+    PYO3_NO_PYTHON=1 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+
+# Verify the Rust package without publishing.
+package:
+    cargo package --locked
+
+# Build the Rust crate for release.
+build:
+    cargo build --locked --release
 
 # Run deterministic, hardware-free tests.
 test:
@@ -32,18 +63,18 @@ linux-benchmark-check:
 python-test:
     uv run --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc 'maturin develop --locked; python -m unittest discover -s python/tests -v'
 
-# Format, test, lint, and check patch whitespace.
-check:
-    cargo fmt --check
-    cargo test --locked --all-targets
-    cargo test --locked --doc
-    cargo clippy --locked --all-targets -- -D warnings
-    PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
-    just python-test
+# Verify release tooling, benchmark accounting, and patch whitespace.
+policy-check:
     uv run scripts/test_cut_release.py
     uv run scripts/test_release_workflow.py
     uv run scripts/test_transport_benchmark.py
     git diff --check -- .
+
+# Run all hardware-free validation, including the Python contract.
+check: fmt-check lint test doc-check python-test policy-check package
+
+# Run the complete validation gate and release build.
+ci: check build
 
 # Validate and create a SemVer GitHub release.
 [positional-arguments]
