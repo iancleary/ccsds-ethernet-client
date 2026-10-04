@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --managed-python --python 3.11 --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Build as the current user; run only the test executable in a disposable netns."""
 import json
 import argparse

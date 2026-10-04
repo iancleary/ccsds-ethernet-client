@@ -74,14 +74,15 @@ jobs:
       - name: Check Python bindings
         run: |
           PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
-          uv run --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc '
+          uv run --managed-python --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc '
             maturin develop --locked
             python -m unittest discover -s python/tests -v
           '
       - name: Run release contract tests
         run: |
-          uv run scripts/test_cut_release.py
-          uv run scripts/test_release_workflow.py
+          uv run --managed-python --python 3.11 scripts/test_cut_release.py
+          uv run --managed-python --python 3.11 scripts/test_release_workflow.py
+          uv run --managed-python --python 3.11 scripts/test_task_runtime.py
       - name: Check documentation
         run: PYO3_NO_PYTHON=1 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
       - name: Verify package

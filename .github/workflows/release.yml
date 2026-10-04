@@ -37,12 +37,13 @@ jobs:
           just linux-benchmark-check
           cargo clippy --locked --all-targets -- -D warnings
           PYO3_NO_PYTHON=1 cargo clippy --locked --features python --all-targets -- -D warnings
-          uv run --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc '
+          uv run --managed-python --python 3.11 --isolated --no-project --with maturin==1.11.5 bash -euc '
             maturin develop --locked
             python -m unittest discover -s python/tests -v
           '
-          uv run scripts/test_cut_release.py
-          uv run scripts/test_release_workflow.py
+          uv run --managed-python --python 3.11 scripts/test_cut_release.py
+          uv run --managed-python --python 3.11 scripts/test_release_workflow.py
+          uv run --managed-python --python 3.11 scripts/test_task_runtime.py
           cargo package --locked
 
   build-python-wheels:
@@ -72,10 +73,10 @@ jobs:
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       - name: Test installed wheel on its native architecture
         run: |
-          uv venv --python 3.11 /tmp/ccsds-wheel-check
+          uv venv --managed-python --python 3.11 /tmp/ccsds-wheel-check
           uv pip install --python /tmp/ccsds-wheel-check/bin/python --no-deps dist/*.whl
           /tmp/ccsds-wheel-check/bin/python -m unittest discover -s python/tests -v
-          python3 scripts/test_linux_live.py --python /tmp/ccsds-wheel-check/bin/python
+          uv run --managed-python --python 3.11 --isolated --no-project scripts/test_linux_live.py --python /tmp/ccsds-wheel-check/bin/python
       - name: Store Python wheel
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

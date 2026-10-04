@@ -30,7 +30,9 @@ standard input rather than reopening the path.
 ## Preconditions and ordering
 
 Run on clean `main` with `git`, `gh`, `just`, and `uv` installed and GitHub CLI
-authenticated. `origin` must resolve directly to
+authenticated. Provision uv-managed Python 3.11 with `uv python install 3.11`.
+The checked-in tasks and workflow use this runtime rather than ambient Python.
+`origin` must resolve directly to
 `iancleary/ccsds-ethernet-client` on `github.com`; lookalike hosts and
 other owners or repositories are rejected. Every `gh` operation explicitly
 selects `github.com` and that repository.

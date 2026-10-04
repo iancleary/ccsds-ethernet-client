@@ -159,6 +159,12 @@ Python binding, release tooling, benchmark accounting, and patch whitespace.
 Package verification requires committed source. These checks do not publish
 artifacts or open a NIC. Linux transport checks remain explicit opt-in tasks.
 
+Python-backed tasks use uv-managed Python 3.11, including Linux fixture commands.
+Provision it with `uv python install 3.11`. An ambient system Python is not used.
+The Linux helper still builds as the caller and uses `sudo -n` only for disposable
+namespace operations when the caller is not root. It preserves the supplied
+installed-wheel Python path and literal command arguments.
+
 Use `just python-test` to run only the extension build and hardware-free Python
 contract tests.
 
